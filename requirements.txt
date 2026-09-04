@@ -1,0 +1,14 @@
+PySide6>=6.7
+sounddevice>=0.4.6
+numpy>=1.26
+faster-whisper>=1.0.3
+anthropic>=0.34
+python-dotenv>=1.0
+
+# GPU (CUDA) runtime for faster-whisper on Windows -- provides cublas64_12.dll / cudnn64_9.dll
+# without needing the full CUDA Toolkit install.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
+
+# Only needed to build the standalone .exe (see README "실행 파일 빌드")
+pyinstaller
