@@ -2,7 +2,7 @@ import shutil
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, QThread, Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QRectF, QSize, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -43,10 +43,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app import db
+from app import cuda_runtime, db
 from app.auto_recorder import KST, AutoRecordController
 from app.cancellation import ProcessingCancelled
-from app.paths import RECORDINGS_DIR, SUMMARIES_DIR, TRANSCRIPTS_DIR
+from app.paths import DATA_DIR, RECORDINGS_DIR, SUMMARIES_DIR, TRANSCRIPTS_DIR
 from app.recorder import Recorder
 from app.schedule import load_schedule, save_schedule
 from app.summarizer import Summarizer
@@ -76,6 +76,14 @@ QLabel#appSubtitle, QLabel#sectionLabel, QLabel#lectureMeta, QLabel#recordHint {
 }
 QLabel#sectionLabel { font-size: 12px; font-weight: 700; letter-spacing: 0.4px; }
 QLabel#lectureTitle { color: #172033; font-size: 20px; font-weight: 700; }
+QLabel#dialogHeadline { color: #172033; font-size: 14px; font-weight: 600; }
+QLabel#infoNote {
+    color: #4A5568;
+    background: #F1F5FD;
+    border: 1px solid #DCE6F8;
+    border-radius: 10px;
+    padding: 12px;
+}
 QLineEdit, QTextEdit, QTreeWidget {
     background: #FFFFFF;
     border: 1px solid #DDE3EE;
@@ -106,6 +114,9 @@ QPushButton:pressed { background: #E7ECF5; }
 QPushButton:disabled { background: #F4F6F9; color: #A0AABD; border-color: #E6EAF0; }
 QPushButton[variant="primary"] { background: #376BEA; color: #FFFFFF; border: none; }
 QPushButton[variant="primary"]:hover { background: #285DD9; }
+/* Without this the rule above keeps disabled primary buttons a solid blue, so
+   they look clickable when they aren't. */
+QPushButton[variant="primary"]:disabled { background: #DCE3F3; color: #A0AABD; }
 QPushButton[variant="danger"] { color: #C73B4B; border-color: #E7C3C8; }
 QPushButton[variant="danger"]:hover { background: #FDF3F4; border-color: #D98F99; }
 QPushButton#headerButton { background: #FFFFFF; padding: 3px 14px; }
@@ -244,23 +255,32 @@ class LectureItemDelegate(QStyledItemDelegate):
         return QSize(opt.rect.width(), height)
 
 
-def _build_app_icon(recording: bool = False) -> QIcon:
+def _build_app_icon(recording: bool = False, size: int = 64) -> QIcon:
     """Draws the app/tray icon in code so packaging doesn't need an extra
-    image asset. A red dot badge shows when auto-recording is active."""
-    pixmap = QPixmap(64, 64)
+    image asset. A red dot badge shows when auto-recording is active.
+
+    `size` exists for tools/make_icon.py, which redraws it at each resolution
+    the .ico needs -- scaling one 64px bitmap down to 16px smears the glyph."""
+    scale = size / 64
+    pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(Qt.NoPen)
     painter.setBrush(QBrush(QColor("#376BEA")))
-    painter.drawRoundedRect(2, 2, 60, 60, 14, 14)
+    painter.drawRoundedRect(QRectF(2 * scale, 2 * scale, 60 * scale, 60 * scale), 14 * scale, 14 * scale)
     painter.setPen(QColor("#FFFFFF"))
-    painter.setFont(QFont("Malgun Gothic", 26, QFont.Bold))
+    font = QFont("Malgun Gothic")
+    font.setBold(True)
+    # Pixel size (not points) so the glyph keeps its proportions no matter what
+    # DPI the machine reports.
+    font.setPixelSize(max(1, round(size * 0.54)))
+    painter.setFont(font)
     painter.drawText(pixmap.rect(), Qt.AlignCenter, "강")
     if recording:
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor("#E5484D")))
-        painter.drawEllipse(40, 40, 20, 20)
+        painter.drawEllipse(QRectF(40 * scale, 40 * scale, 20 * scale, 20 * scale))
     painter.end()
     return QIcon(pixmap)
 
@@ -702,6 +722,269 @@ class AutoRecordStatusDialog(QDialog):
         super().closeEvent(event)
 
 
+def _format_size(num_bytes: int) -> str:
+    if num_bytes >= 1 << 30:
+        return f"{num_bytes / (1 << 30):.1f}GB"
+    return f"{num_bytes / (1 << 20):.0f}MB"
+
+
+class CudaDownloadWorker(QThread):
+    """Runs the CUDA runtime download off the UI thread -- it is well over 1GB."""
+
+    progress = Signal(int, int)
+    succeeded = Signal()
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def run(self):
+        try:
+            cuda_runtime.install(
+                progress_cb=lambda done, total: self.progress.emit(done, total),
+                should_cancel=lambda: self._cancel_requested,
+            )
+        except ProcessingCancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit()
+
+
+# 드라이버와 헷갈리기 쉬워서 창에 그대로 띄웁니다. 그래픽카드가 이미 잘 돌아가고
+# 있는데 왜 1.3GB를 또 받아야 하는지 설명이 없으면 대부분 그냥 닫습니다.
+DRIVER_NOTE = (
+    "이 파일은 이미 설치된 그래픽 드라이버와 다른 것입니다.\n\n"
+    "· 그래픽 드라이버 — 화면 출력처럼 그래픽카드를 쓰기 위한 기본 프로그램입니다. "
+    "이미 설치되어 있고, 그래서 위에 카드 이름이 보입니다.\n\n"
+    "· 지금 받는 파일 — 그 위에서 음성 인식 계산을 대신 처리하는 라이브러리"
+    "(cuBLAS·cuDNN)입니다. 원래 CUDA Toolkit을 따로 설치해야 생기는 파일이라, "
+    "드라이버만 있는 상태에서는 아직 없습니다.\n\n"
+    "드라이버나 Windows 설정은 전혀 바꾸지 않습니다. 앱 전용 폴더에만 저장되고, "
+    "필요 없어지면 이 창에서 삭제할 수 있습니다."
+)
+
+NO_GPU_NOTE = (
+    "GPU 가속은 NVIDIA 그래픽카드가 있어야 쓸 수 있습니다. "
+    "드라이버가 설치되어 있지 않은 경우에도 이렇게 표시될 수 있습니다.\n\n"
+    "가속 없이도 녹음·녹취·요약 기능은 모두 그대로 동작합니다. "
+    "텍스트로 바꾸는 데 시간이 더 걸릴 뿐입니다."
+)
+
+
+class GpuSetupDialog(QDialog):
+    """GPU 가속(CUDA 런타임)을 내려받는 창입니다.
+
+    큰 파일이라 실행 파일에 넣지 않고, GPU가 있는 컴퓨터에서 한 번만 받습니다.
+    받지 않아도 앱은 CPU로 동작합니다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("GPU 가속 설정")
+        self.setMinimumWidth(520)
+        self.setStyleSheet(APP_STYLESHEET)
+        self.worker: CudaDownloadWorker | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        title_label = QLabel("GPU 가속 설정")
+        title_label.setObjectName("lectureTitle")
+        layout.addWidget(title_label)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("dialogHeadline")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setObjectName("recordHint")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+
+        self.note_label = QLabel("")
+        self.note_label.setObjectName("infoNote")
+        self.note_label.setWordWrap(True)
+        layout.addWidget(self.note_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        btn_row = QHBoxLayout()
+        self.remove_btn = QPushButton("삭제")
+        self.remove_btn.clicked.connect(self._remove)
+        btn_row.addWidget(self.remove_btn)
+        btn_row.addStretch()
+        self.close_btn = QPushButton("닫기")
+        self.close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.close_btn)
+        self.action_btn = QPushButton("다운로드")
+        self.action_btn.setProperty("variant", "primary")
+        self.action_btn.clicked.connect(self._on_action)
+        btn_row.addWidget(self.action_btn)
+        layout.addLayout(btn_row)
+
+        self._refresh()
+
+    def _is_downloading(self) -> bool:
+        return self.worker is not None and self.worker.isRunning()
+
+    @staticmethod
+    def _set_variant(button: QPushButton, variant: str):
+        """Qt resolves property-based styles once, so a variant change only
+        takes effect after the widget is re-polished."""
+        button.setProperty("variant", variant)
+        button.style().unpolish(button)
+        button.style().polish(button)
+
+    def _refresh(self):
+        if self._is_downloading():
+            return
+
+        installed = cuda_runtime.is_installed()
+        gpu = cuda_runtime.gpu_name()
+        self.progress_bar.setVisible(False)
+        self.note_label.setVisible(True)
+        self.remove_btn.setVisible(installed)
+        self.action_btn.setText("다시 다운로드" if installed else "다운로드")
+        # Emphasise the download only while it is still the useful next click.
+        # Once installed nothing needs emphasis, and the primary style would sit
+        # left of "다시 다운로드" anyway, which reads as the wrong button.
+        self._set_variant(self.action_btn, "" if installed else "primary")
+        self._set_variant(self.close_btn, "")
+        self.close_btn.setEnabled(True)
+
+        if installed:
+            self.status_label.setText(
+                "GPU 가속이 설치되어 있습니다." if gpu is None else f"GPU 가속을 사용 중입니다. ({gpu})"
+            )
+            self.detail_label.setText(
+                f"음성 인식에 GPU를 사용합니다. 저장 위치: {cuda_runtime.CUDA_DIR}"
+            )
+            self.note_label.setText(DRIVER_NOTE)
+            self.action_btn.setVisible(True)
+        elif not cuda_runtime.has_nvidia_gpu():
+            self.status_label.setText("이 컴퓨터에서는 GPU 가속을 쓸 수 없습니다.")
+            self.detail_label.setText("NVIDIA 그래픽카드를 찾지 못해 음성 인식은 CPU로 동작합니다.")
+            self.note_label.setText(NO_GPU_NOTE)
+            # Nothing to download, so the button would only be a dead control.
+            self.action_btn.setVisible(False)
+            self._set_variant(self.close_btn, "primary")
+        else:
+            self.status_label.setText(
+                "GPU 가속을 쓸 수 있는 컴퓨터입니다."
+                if gpu is None
+                else f"GPU 가속을 쓸 수 있는 컴퓨터입니다. ({gpu})"
+            )
+            self.detail_label.setText(
+                "약 1.3GB를 내려받으면 음성 인식이 크게 빨라집니다. 한 번만 받으면 되고, "
+                "앱을 새 버전으로 바꿔도 다시 받지 않습니다. 지금 받지 않아도 앱은 CPU로 "
+                "그대로 동작하며, 나중에 설정 메뉴에서 다시 열 수 있습니다."
+            )
+            self.note_label.setText(DRIVER_NOTE)
+            self.action_btn.setVisible(True)
+
+    def _on_action(self):
+        if self._is_downloading():
+            self.worker.cancel()
+            self.action_btn.setEnabled(False)
+            self.status_label.setText("중지하는 중입니다...")
+            self.detail_label.setText("")
+            return
+        self._start_download()
+
+    def _start_download(self):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("")
+        self.status_label.setText("GPU 가속을 내려받는 중입니다.")
+        self.detail_label.setText("연결하는 중입니다...")
+        # Hidden while downloading so the progress bar isn't pushed off-screen
+        # by the explanation the user has already read.
+        self.note_label.setVisible(False)
+        self.action_btn.setText("중지")
+        self.action_btn.setVisible(True)
+        self.action_btn.setEnabled(True)
+        self._set_variant(self.action_btn, "danger")
+        self.remove_btn.setVisible(False)
+        self._set_variant(self.close_btn, "")
+        self.close_btn.setEnabled(False)
+
+        self.worker = CudaDownloadWorker(self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.succeeded.connect(self._on_succeeded)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.cancelled.connect(self._on_cancelled)
+        self.worker.start()
+
+    def _on_progress(self, done: int, total: int):
+        if total <= 0:
+            return
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat("%p%")
+        self.detail_label.setText(
+            f"{_format_size(done)} / {_format_size(total)} · 창을 닫지 말고 기다려 주세요."
+        )
+
+    def _finish_download(self):
+        self.worker = None
+        self.close_btn.setEnabled(True)
+        self.action_btn.setEnabled(True)
+
+    def _on_succeeded(self):
+        self._finish_download()
+        self._refresh()
+        QMessageBox.information(
+            self,
+            "GPU 가속 설치 완료",
+            "GPU 가속을 설치했습니다. 앱을 다시 시작하면 적용됩니다.",
+        )
+
+    def _on_cancelled(self):
+        self._finish_download()
+        self._refresh()
+
+    def _on_failed(self, message: str):
+        self._finish_download()
+        self._refresh()
+        QMessageBox.warning(
+            self,
+            "다운로드 실패",
+            f"GPU 가속 파일을 받지 못했습니다.\n\n{message}\n\n"
+            "인터넷 연결을 확인한 뒤 다시 시도해 주세요. 그동안에도 앱은 CPU로 동작합니다.",
+        )
+
+    def _remove(self):
+        reply = QMessageBox.question(
+            self,
+            "삭제 확인",
+            "내려받은 GPU 가속 파일을 삭제할까요? 녹취 변환은 CPU로 동작하게 됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        cuda_runtime.uninstall()
+        self._refresh()
+
+    def closeEvent(self, event):
+        # Letting the window go while the thread still writes into the staging
+        # folder would leave a half-finished install behind.
+        if self._is_downloading():
+            self.worker.cancel()
+            self.worker.wait(5000)
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -745,6 +1028,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction("자동 녹음 설정", self.open_schedule_settings)
         settings_menu.addAction("자동 녹음 상태", self.open_auto_status)
         settings_menu.addSeparator()
+        settings_menu.addAction("GPU 가속 설정", self.open_gpu_setup)
         settings_menu.addAction("중복된 강의 정리", self.cleanup_duplicates)
         settings_btn.setMenu(settings_menu)
         header_layout.addWidget(settings_btn)
@@ -890,6 +1174,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_list()
 
+        # Deferred so the main window is painted before the offer appears on top
+        # of it, rather than the dialog being the first thing on screen.
+        QTimer.singleShot(0, self._maybe_offer_gpu_setup)
+
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(_build_app_icon(), self)
         self.tray.setToolTip("강의 노트")
@@ -942,6 +1230,24 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             dialog.save()
             self.auto_controller.check_now()
+
+    def open_gpu_setup(self):
+        GpuSetupDialog(self).exec()
+
+    def _maybe_offer_gpu_setup(self):
+        """Shows the GPU download offer once, on the first run of a machine that
+        could use it. Without this the exe just quietly runs on CPU and nobody
+        would think to look in the settings menu for the reason."""
+        marker = DATA_DIR / ".gpu_prompt_shown"
+        if marker.exists():
+            return
+        try:
+            marker.write_text("", encoding="utf-8")
+        except OSError:
+            return
+        if cuda_runtime.is_installed() or not cuda_runtime.has_nvidia_gpu():
+            return
+        self.open_gpu_setup()
 
     def open_auto_status(self):
         if self._status_dialog is not None and self._status_dialog.isVisible():

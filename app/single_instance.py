@@ -12,6 +12,12 @@ CONNECT_TIMEOUT_MS = 500
 
 ASFW_ANY = -1
 
+# LectureNotes.iss checks this name (AppMutex) to see whether the app is running
+# before it overwrites files. The installer can't just close our window instead:
+# closeEvent hides to the tray rather than quitting, so the process would live on
+# holding the exe open, and the install would fail halfway through.
+RUNNING_MUTEX_NAME = "LectureNotes-running"
+
 
 def _allow_foreground_handoff() -> None:
     """Windows refuses to let a background process raise its own window. The
@@ -40,6 +46,31 @@ class SingleInstance(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._server: QLocalServer | None = None
+        self._mutex: int | None = None
+
+    def _claim_running_mutex(self) -> None:
+        """Held for the lifetime of the process purely so the installer can see
+        that the app is up."""
+        if sys.platform != "win32":
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            self._mutex = kernel32.CreateMutexW(None, False, RUNNING_MUTEX_NAME)
+        except (AttributeError, OSError):
+            self._mutex = None
+
+    def _release_running_mutex(self) -> None:
+        if self._mutex is None:
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle(self._mutex)
+        except (AttributeError, OSError):
+            pass
+        self._mutex = None
 
     def try_acquire(self) -> bool:
         """True if this process owns the app, False if an existing instance
@@ -53,6 +84,8 @@ class SingleInstance(QObject):
             socket.waitForBytesWritten(CONNECT_TIMEOUT_MS)
             socket.disconnectFromServer()
             return False
+
+        self._claim_running_mutex()
 
         # Nothing answered, so any leftover name belongs to a crashed run.
         QLocalServer.removeServer(SERVER_NAME)
@@ -79,3 +112,4 @@ class SingleInstance(QObject):
             self._server.close()
             self._server = None
         QLocalServer.removeServer(SERVER_NAME)
+        self._release_running_mutex()

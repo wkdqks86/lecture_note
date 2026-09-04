@@ -98,21 +98,24 @@ app/
 VSCode/터미널 없이 다른 사람도 실행할 수 있도록 PyInstaller로 배포용 exe를 만들 수 있습니다.
 Whisper 모델(large-v3 약 3GB)은 exe에 포함하지 않고, 최초 실행 시 인터넷으로 자동 다운로드합니다.
 
-```bash
-pip install -r requirements.txt  # pyinstaller 포함
-pyinstaller --noconfirm --clean --onedir --windowed --name LectureNotes ^
-  --collect-all ctranslate2 ^
-  --collect-all faster_whisper ^
-  --collect-all av ^
-  --collect-all onnxruntime ^
-  --collect-all tokenizers ^
-  --collect-all huggingface_hub ^
-  --collect-all nvidia ^
-  main.py
+```bat
+pip install -r requirements.txt  REM pyinstaller 포함
+pyinstaller LectureNotes.spec --noconfirm
 
-REM 공유받는 사람용 초기 세팅 안내문 (API 키 등록 방법 등). --clean 때문에 매번
-REM dist/LectureNotes/가 새로 만들어지므로 빌드 후 다시 복사해 넣습니다.
+REM 공유받는 사람용 초기 세팅 안내문 (API 키 등록 방법 등). 빌드할 때마다
+REM dist\LectureNotes\가 새로 만들어지므로 빌드 후 다시 복사해 넣습니다.
 copy USER_README.txt dist\LectureNotes\README.txt
+```
+
+빌드 설정은 `LectureNotes.spec`에 있습니다 (포함할 패키지, 제외할 `nvidia`, 아이콘).
+명령줄 옵션 대신 이 파일을 고치세요 — `.gitignore`가 `*.spec`을 무시하지만 이 파일만은
+예외로 추적합니다. 없이 빌드하면 CUDA가 다시 포함되어 2.3GB로 불어납니다.
+
+앱 아이콘(`assets/LectureNotes.ico`)은 트레이 아이콘을 그리는 코드에서 생성합니다.
+`_build_app_icon()`을 고쳤다면 다시 만들어 주세요:
+
+```bat
+.venv\Scripts\python tools\make_icon.py
 ```
 
 사용자 데이터(`recordings/`, `transcripts/`, `summaries/`, `models/`, `lecture_notes.db`,
@@ -121,20 +124,72 @@ copy USER_README.txt dist\LectureNotes\README.txt
 없어졌습니다.
 
 결과물은 `dist/LectureNotes/` 폴더에 생성됩니다 (`LectureNotes.exe` + `_internal/` +
-`README.txt`). CUDA 런타임 DLL(cuBLAS/cuDNN)이 함께 포함되어 있어, 실행 PC에 NVIDIA
-GPU 드라이버만 있으면 CUDA Toolkit을 따로 설치할 필요가 없습니다. **`dist/LectureNotes/`
-폴더 전체를 그대로 복사(또는 zip)해서 배포**해야 합니다 (exe 파일 하나만 옮기면 동작하지
-않습니다). `README.txt`는 `USER_README.txt`(프로젝트 루트)가 원본이고, 처음 받는 사람이
-API 키를 등록하는 방법을 안내합니다 — 내용을 고칠 땐 `USER_README.txt`를 수정하세요.
+`README.txt`). **`dist/LectureNotes/` 폴더 전체를 그대로 복사(또는 zip)해서 배포**해야
+합니다 (exe 파일 하나만 옮기면 동작하지 않습니다). `README.txt`는 `USER_README.txt`
+(프로젝트 루트)가 원본이고, 처음 받는 사람이 API 키를 등록하는 방법을 안내합니다 —
+내용을 고칠 땐 `USER_README.txt`를 수정하세요.
 
-- 배포 폴더 크기는 CUDA 런타임 때문에 약 2.3GB입니다.
-- `--onedir` 대신 `--onefile`을 쓰지 마세요 — 실행할 때마다 2GB+ 를 임시 폴더에
-  풀어야 해서 시작이 매우 느려지고, 앱 데이터 경로 처리와도 맞지 않습니다.
+- 배포 폴더 크기는 약 346MB입니다. 용량이 큰 두 가지는 빌드에 넣지 않고 필요할 때
+  인터넷에서 받습니다: Whisper 모델(large-v3, 약 3GB)과 CUDA 런타임(약 1.3GB).
+- `--onedir` 대신 `--onefile`을 쓰지 마세요 — 실행할 때마다 배포 폴더 전체를 임시
+  폴더에 풀어야 해서 시작이 매우 느려지고, 앱 데이터 경로 처리와도 맞지 않습니다.
 - `.env`의 `ANTHROPIC_API_KEY`는 exe에 포함되지 않으므로, 처음 실행한 뒤
   `%LOCALAPPDATA%\LectureNotes\.env` 파일을 직접 만들어 넣어주세요 (`ANTHROPIC_API_KEY=...`
   한 줄). 예전 버전에서 exe 옆에 `.env`를 뒀던 경우 첫 실행 시 자동으로 옮겨줍니다.
 - 다른 PC에 NVIDIA GPU가 없거나 GPU 초기화에 실패하면 `Transcriber`가 자동으로
   CPU + medium 모델로 전환됩니다 (large-v3보다 빠르지만 정확도는 약간 낮음).
+
+## 설치 파일(setup.exe) 만들기
+
+`dist/LectureNotes/` 폴더를 그대로 건네주는 대신, 더블클릭 한 번으로 설치되는
+`setup.exe`를 만들 수 있습니다. [Inno Setup](https://jrsoftware.org/isinfo.php)이
+필요합니다 (`winget install JRSoftware.InnoSetup`).
+
+```bat
+REM 1) 먼저 exe를 빌드해 둡니다 (위 "실행 파일(exe) 빌드" 참고)
+pyinstaller LectureNotes.spec --noconfirm
+copy USER_README.txt dist\LectureNotes\README.txt
+
+REM 2) 설치 파일 컴파일
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" LectureNotes.iss
+```
+
+결과물은 `installer\LectureNotes-Setup-<버전>.exe` 입니다. 346MB 폴더가 약 92MB로
+압축되므로, 배포할 때는 이 파일 하나만 건네주면 됩니다.
+
+- **관리자 권한이 필요 없습니다.** `%LOCALAPPDATA%\Programs\LectureNotes`에 설치되어
+  UAC 창이 뜨지 않고, 권한이 제한된 회사·학교 PC에서도 설치됩니다.
+- 설치 화면에서 바탕화면 바로가기와 **Windows 시작 시 자동 실행**을 선택할 수 있고,
+  둘 다 기본으로 켜져 있습니다. 자동 녹음은 앱이 떠 있어야 동작하기 때문입니다.
+- **앱이 실행 중이면 설치가 중단되고 종료 안내가 뜹니다.** 창을 닫아도 트레이에 남는
+  구조라 설치 프로그램이 창만 닫게 두면 프로세스가 살아남아 파일이 잠긴 채 설치가
+  깨집니다. 이를 위해 앱이 `LectureNotes-running` 뮤텍스를 잡고, `.iss`의 `AppMutex`가
+  그것을 확인합니다 (`app/single_instance.py`). 녹음 중일 수도 있으므로 강제 종료는
+  하지 않습니다.
+- **제거해도 녹음·요약·설정은 지워지지 않습니다.** 사용자 데이터는 설치 폴더가 아니라
+  `%LOCALAPPDATA%\LectureNotes\`에 있어서, 제거 후 다시 설치하면 그대로 이어집니다.
+  제거가 끝나면 데이터가 어디 남아 있는지 안내창으로 알려줍니다.
+- 버전을 올릴 땐 `LectureNotes.iss`의 `AppVersion`만 고치면 됩니다. `AppId`(GUID)는
+  같은 앱임을 알아보고 덮어쓰기·제거를 처리하는 값이라 **절대 바꾸지 마세요.**
+
+### GPU 가속 (CUDA 런타임 자동 다운로드)
+
+cuBLAS/cuDNN DLL은 압축을 풀면 1.9GB로, 예전 빌드 2.27GB의 85%를 차지했습니다.
+NVIDIA GPU가 있는 PC에서만 쓸모가 있으므로 exe에 넣지 않고, `app/cuda_runtime.py`가
+PyPI의 공식 휠(`nvidia-cublas-cu12`, `nvidia-cuda-nvrtc-cu12`, `nvidia-cudnn-cu12`)에서
+필요한 DLL만 받아 `%LOCALAPPDATA%\LectureNotes\cuda\`에 풀어둡니다.
+(다운로드 1.3GB → 압축 해제 후 약 2.0GB, DLL 16개.)
+
+- NVIDIA GPU가 감지되면 **첫 실행 때 한 번** 다운로드를 권하는 창이 뜹니다. 이후에는
+  **설정 → GPU 가속 설정**에서 언제든 받거나 지울 수 있습니다.
+- 받지 않아도 앱은 그대로 동작합니다 (CPU + medium 모델). 인터넷이 없거나 다운로드에
+  실패해도 마찬가지라, 가속은 "되면 빨라지는" 선택 사항입니다.
+- 사용자 데이터와 같은 곳에 저장되므로 exe를 새 버전으로 교체해도 다시 받지 않습니다.
+- 받는 도중 **중지**를 눌러도 안전합니다. 임시 폴더(`cuda.part`)에 받은 뒤 완료된
+  경우에만 제자리로 옮기므로, 중간에 끊긴 파일이 설치된 것처럼 남지 않습니다.
+- 버전은 `PACKAGES`에 고정돼 있고, 내려받은 파일은 SHA-256으로 검증합니다.
+- 개발 환경(`.venv`)에서는 `requirements.txt`로 설치한 pip 패키지를 그대로 쓰므로
+  따로 받을 필요가 없습니다 — `_cuda_dll_dirs()`가 두 위치를 모두 확인합니다.
 
 ## 다음 단계 후보
 

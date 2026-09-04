@@ -6,8 +6,14 @@ recordings/*.wav
 transcripts/*.txt
 summaries/*.md
 models/
+cuda/
+.gpu_prompt_shown
 lecture_notes.db
 schedule.json
 build/
 dist/
+installer/
+# PyInstaller가 자동 생성하는 spec은 무시하되, 직접 수정해 쓰는 빌드 설정은 추적합니다
+# (nvidia 제외 설정이 여기 있어서, 없으면 배포 폴더가 다시 2.3GB로 불어납니다).
 *.spec
+!LectureNotes.spec

@@ -21,6 +21,8 @@ else:
     DATA_DIR = BASE_DIR
 
 MODEL_DIR = DATA_DIR / "models"
+# CUDA runtime DLLs, downloaded on demand rather than shipped in the exe.
+CUDA_DIR = DATA_DIR / "cuda"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 SUMMARIES_DIR = DATA_DIR / "summaries"
