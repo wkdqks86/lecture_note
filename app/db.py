@@ -33,16 +33,20 @@ class Lecture:
     summary_path: str | None
     status: str
     content_hash: str | None = None
+    raw_transcript_path: str | None = None
+    words_path: str | None = None
+    material_path: str | None = None
 
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute(SCHEMA)
-    try:
-        conn.execute("ALTER TABLE lectures ADD COLUMN content_hash TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists (pre-existing db file)
+    for column in ("content_hash TEXT", "raw_transcript_path TEXT", "words_path TEXT", "material_path TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE lectures ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass  # column already exists (pre-existing db file)
     return conn
 
 
@@ -70,12 +74,32 @@ def update_title(lecture_id: int, title: str) -> None:
         conn.execute("UPDATE lectures SET title = ? WHERE id = ?", (title, lecture_id))
 
 
-def update_transcript(lecture_id: int, transcript_path: str) -> None:
+def update_transcript(
+    lecture_id: int,
+    transcript_path: str,
+    raw_transcript_path: str | None = None,
+    words_path: str | None = None,
+) -> None:
     with get_connection() as conn:
         conn.execute(
-            "UPDATE lectures SET transcript_path = ?, status = 'transcribed' WHERE id = ?",
-            (transcript_path, lecture_id),
+            "UPDATE lectures SET transcript_path = ?, raw_transcript_path = ?, words_path = ?, "
+            "status = 'transcribed' WHERE id = ?",
+            (transcript_path, raw_transcript_path, words_path, lecture_id),
         )
+
+
+def update_transcript_path(lecture_id: int, transcript_path: str) -> None:
+    """Used after the term-review UI edits the (already corrected) transcript
+    in place -- doesn't touch raw_transcript_path/words_path or status."""
+    with get_connection() as conn:
+        conn.execute("UPDATE lectures SET transcript_path = ? WHERE id = ?", (transcript_path, lecture_id))
+
+
+def update_material(lecture_id: int, material_path: str | None) -> None:
+    """Links (or unlinks, with None) the lecture handout/notebook used as
+    reference material when correcting and summarising this lecture."""
+    with get_connection() as conn:
+        conn.execute("UPDATE lectures SET material_path = ? WHERE id = ?", (material_path, lecture_id))
 
 
 def update_summary(lecture_id: int, summary_path: str) -> None:
@@ -103,18 +127,35 @@ def get_lecture(lecture_id: int) -> Lecture | None:
         return Lecture(**dict(row)) if row else None
 
 
-def delete_lecture(lecture_id: int, delete_files: bool = True) -> None:
+def delete_lecture(lecture_id: int, delete_files: bool = True) -> list[str]:
+    """Deletes the row, plus its files when asked. Returns the files that could
+    not be deleted -- on Windows unlink fails while the audio is still open by
+    a running transcription, and letting that abort the whole call left the
+    lecture sitting in the list as if the delete had been ignored. The row is
+    now always removed, locked file or not."""
+    undeleted: list[str] = []
     lecture = get_lecture(lecture_id)
     if lecture and delete_files:
-        for path_str in (lecture.audio_path, lecture.transcript_path, lecture.summary_path):
+        for path_str in (
+            lecture.audio_path,
+            lecture.transcript_path,
+            lecture.summary_path,
+            lecture.raw_transcript_path,
+            lecture.words_path,
+        ):
             if not path_str:
                 continue
             path = Path(path_str)
-            if path.is_file():
-                path.unlink(missing_ok=True)
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                undeleted.append(str(path))
 
     with get_connection() as conn:
         conn.execute("DELETE FROM lectures WHERE id = ?", (lecture_id,))
+    return undeleted
 
 
 def backfill_content_hashes() -> int:
@@ -133,6 +174,30 @@ def backfill_content_hashes() -> int:
             conn.execute("UPDATE lectures SET content_hash = ? WHERE id = ?", (digest, row["id"]))
             updated += 1
     return updated
+
+
+def backfill_raw_transcript_links() -> int:
+    """Self-heals rows where correction actually ran and wrote a `_raw.txt`
+    sibling file, but raw_transcript_path never got persisted (seen after a
+    stale-build mismatch once already) -- relinks by filename convention so
+    the correction-status indicator doesn't wrongly call these "구버전".
+    Returns the number of rows fixed."""
+    fixed = 0
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, transcript_path FROM lectures "
+            "WHERE raw_transcript_path IS NULL AND transcript_path IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            transcript_path = Path(row["transcript_path"])
+            raw_candidate = transcript_path.with_name(transcript_path.stem + "_raw" + transcript_path.suffix)
+            if raw_candidate.is_file():
+                conn.execute(
+                    "UPDATE lectures SET raw_transcript_path = ? WHERE id = ?",
+                    (str(raw_candidate), row["id"]),
+                )
+                fixed += 1
+    return fixed
 
 
 def find_duplicate_groups() -> list[list[Lecture]]:

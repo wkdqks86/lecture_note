@@ -1,11 +1,27 @@
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from faster_whisper import WhisperModel
 
 from app.paths import CUDA_DIR, MODEL_DIR
+
+
+@dataclass
+class WordInfo:
+    word: str
+    start: float
+    end: float
+    probability: float
+    segment_index: int = 0
+
+
+@dataclass
+class TranscriptionResult:
+    text: str
+    words: list[WordInfo] = field(default_factory=list)
 
 # RTX A3000 Laptop (6GB VRAM) handles large-v3 comfortably in float16.
 DEFAULT_MODEL_SIZE = "large-v3"
@@ -86,9 +102,10 @@ class Transcriber:
         audio_path: Path,
         language: str = "ko",
         progress_cb: Callable[[float], None] | None = None,
-    ) -> str:
+        hotwords: str | None = None,
+    ) -> TranscriptionResult:
         try:
-            return self._run(audio_path, language, progress_cb)
+            return self._run(audio_path, language, progress_cb, hotwords)
         except Exception:
             if self._device != "cuda":
                 raise
@@ -96,7 +113,7 @@ class Transcriber:
             # broken GPU runtime can surface here even though construction above
             # succeeded. Fall back to CPU once instead of crashing the pipeline.
             self._fallback_to_cpu()
-            return self._run(audio_path, language, progress_cb)
+            return self._run(audio_path, language, progress_cb, hotwords)
 
     def _fallback_to_cpu(self) -> None:
         self._device = "cpu"
@@ -114,7 +131,8 @@ class Transcriber:
         audio_path: Path,
         language: str,
         progress_cb: Callable[[float], None] | None,
-    ) -> str:
+        hotwords: str | None,
+    ) -> TranscriptionResult:
         segments, info = self.model.transcribe(
             str(audio_path),
             language=language,
@@ -126,16 +144,34 @@ class Transcriber:
             condition_on_previous_text=False,
             repetition_penalty=1.1,
             no_repeat_ngram_size=3,
+            # Biases recognition toward the user's glossary terms (technical
+            # jargon, English acronyms) for the whole audio. Unlike
+            # initial_prompt, this isn't tied to condition_on_previous_text.
+            hotwords=hotwords or None,
+            # Per-word confidence, so low-confidence words can be flagged for
+            # review later instead of silently trusted.
+            word_timestamps=True,
         )
 
         lines = []
-        for seg in segments:
+        words: list[WordInfo] = []
+        for seg_index, seg in enumerate(segments):
             timestamp = f"[{_fmt(seg.start)} -> {_fmt(seg.end)}]"
             lines.append(f"{timestamp} {seg.text.strip()}")
+            for w in seg.words or []:
+                words.append(
+                    WordInfo(
+                        word=w.word.strip(),
+                        start=w.start,
+                        end=w.end,
+                        probability=w.probability,
+                        segment_index=seg_index,
+                    )
+                )
             if progress_cb and info.duration:
                 progress_cb(min(seg.end / info.duration, 1.0))
 
-        return "\n".join(lines)
+        return TranscriptionResult(text="\n".join(lines), words=words)
 
 
 def _fmt(seconds: float) -> str:

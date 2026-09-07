@@ -26,14 +26,22 @@ CUDA_DIR = DATA_DIR / "cuda"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 SUMMARIES_DIR = DATA_DIR / "summaries"
+# Lecture handouts/notebooks attached to a lecture, copied in so the original
+# can be moved or deleted without breaking the link.
+MATERIALS_DIR = DATA_DIR / "materials"
 DB_PATH = DATA_DIR / "lecture_notes.db"
 SCHEDULE_PATH = DATA_DIR / "schedule.json"
 ENV_PATH = DATA_DIR / ".env"
+GLOSSARY_PATH = DATA_DIR / "glossary.json"
+TERM_STATS_PATH = DATA_DIR / "term_stats.json"
+# Material registered for a given day up front, so lectures auto-recorded that
+# day are linked to it the moment they're created.
+DAY_MATERIAL_PATH = DATA_DIR / "day_material.json"
 
 
 def ensure_dirs() -> None:
     """A fresh install (e.g. a newly copied exe distribution folder, or the
     first-ever run) starts with none of these -- create them all up front
     instead of relying on each write site to remember to."""
-    for path in (MODEL_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, SUMMARIES_DIR):
+    for path in (MODEL_DIR, RECORDINGS_DIR, TRANSCRIPTS_DIR, SUMMARIES_DIR, MATERIALS_DIR):
         path.mkdir(parents=True, exist_ok=True)

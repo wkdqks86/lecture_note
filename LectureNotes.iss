@@ -6,7 +6,7 @@
 ; 결과물: installer\LectureNotes-Setup-<버전>.exe
 
 #define AppName "강의 노트"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "Peter"
 #define AppExe "LectureNotes.exe"
 

@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
+from app import crashlog
 from app.paths import BASE_DIR, DATA_DIR, ENV_PATH, ensure_dirs
 from app.single_instance import SingleInstance
 
@@ -29,6 +30,7 @@ def main():
     # folders (models/recordings/transcripts/summaries) -- create them before
     # anything tries to write into them.
     ensure_dirs()
+    crashlog.install()
     _load_env()
     app = QApplication(sys.argv)
 

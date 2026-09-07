@@ -94,15 +94,27 @@ class AutoRecordController(QObject):
             self.status_changed.emit(f"{current.period}교시 녹음 종료됨")
             return
 
+        if self.active_period == current.period:
+            # Already recording this period -- but re-announce it rather than
+            # returning silently. The UI connects to status_changed only after
+            # this controller's constructor has run, so if a period was already
+            # under way at launch nothing ever replaced the footer's initial
+            # "waiting" placeholder, and it claimed to be idle for the whole
+            # class. Checked before `suspended` so an auto recording in
+            # progress reports itself accurately even if a manual recording
+            # dialog is open on top of it.
+            if self.is_paused:
+                self.status_changed.emit(f"{current.period}교시 일시정지")
+            else:
+                self.status_changed.emit(f"{current.period}교시 자동 녹음 중")
+            return
+
         if self.suspended:
             # A manual recording owns the mic right now -- don't start a
             # competing stream. We simply miss this check; the next tick
             # will pick the period back up once the manual session ends.
             self.status_changed.emit("수동 녹음 중 (자동 녹음 대기)")
             return
-
-        if self.active_period == current.period:
-            return  # already recording this period, nothing to do
 
         if self.active_period is not None:
             # Shouldn't normally happen (periods don't overlap), but don't leave

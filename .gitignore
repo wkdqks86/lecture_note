@@ -10,6 +10,11 @@ cuda/
 .gpu_prompt_shown
 lecture_notes.db
 schedule.json
+glossary.json
+term_stats.json
+day_material.json
+crash.log
+materials/
 build/
 dist/
 installer/

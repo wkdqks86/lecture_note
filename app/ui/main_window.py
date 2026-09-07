@@ -43,18 +43,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app import cuda_runtime, db
+from app import cuda_runtime, db, glossary, materials, term_stats
 from app.auto_recorder import KST, AutoRecordController
 from app.cancellation import ProcessingCancelled
-from app.paths import DATA_DIR, RECORDINGS_DIR, SUMMARIES_DIR, TRANSCRIPTS_DIR
+from app.corrector import TranscriptCorrector
+from app.paths import DATA_DIR, MATERIALS_DIR, RECORDINGS_DIR, SUMMARIES_DIR, TRANSCRIPTS_DIR
 from app.recorder import Recorder
 from app.schedule import load_schedule, save_schedule
 from app.summarizer import Summarizer
 from app.transcriber import Transcriber
 from app.utils import hash_file
+from app.word_review import FlaggedWord, find_ambiguous_words, generate_candidates, load_words, save_words
 
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
 LECTURE_ID_ROLE = 1000
+WORD_ROLE = 1001
 
 # 앱 전체에 같은 색, 여백, 버튼 규칙을 적용합니다.
 # 스타일을 한 곳에 모으면 화면을 수정할 때 여러 위젯을 찾아다니지 않아도 됩니다.
@@ -96,10 +99,14 @@ QLineEdit:focus, QTextEdit:focus, QTreeWidget:focus {
     border: 1px solid #4F7EF7;
 }
 QLineEdit { min-height: 30px; }
-QTreeWidget { padding: 5px; outline: 0; border-color: #E8ECF4; }
-QTreeWidget::item { border-radius: 8px; padding: 0px 6px; margin: 2px 0; }
-QTreeWidget::item:selected { background: #E6EEFF; color: #1F55CB; }
-QTreeWidget::item:hover { background: #F2F5FA; }
+/* The row highlight is painted by LectureItemDelegate, not from here: a
+   stylesheet ::item background also gets drawn across the tree's indent
+   gutter, which left a stray coloured block to the left of each row.
+   selection-background-color is cleared for the same reason (it is what the
+   native style fills the gutter with), and ::branch is deliberately left
+   alone -- styling it at all makes Qt drop its expand/collapse arrow. */
+QTreeWidget { padding: 5px; outline: 0; border-color: #E8ECF4; selection-background-color: transparent; }
+QTreeWidget::item { padding: 0px 6px; margin: 2px 0; }
 QPushButton {
     background: #FFFFFF;
     border: 1px solid #D8DFEB;
@@ -166,6 +173,28 @@ STATUS_LABELS = {
 }
 
 
+def _correction_status_label(lecture: db.Lecture) -> str | None:
+    """None means the transcript is corrected (or there's nothing to correct
+    yet). Otherwise, a short suffix to show next to the status label,
+    distinguishing two different reasons a transcript is still raw:
+
+    - never attempted: this lecture predates the correction feature, so
+      raw_transcript_path was never set at all -- easy to mistake for
+      "already corrected" if we only checked for a stuck-in-progress marker.
+    - stuck mid-way: correction was attempted (raw_transcript_path exists)
+      but transcript_path still equals it, meaning it failed before
+      overwriting the transcript with corrected text (e.g. API credit ran
+      out) -- retry_lecture resumes from here instead of skipping to summary.
+    """
+    if not lecture.transcript_path:
+        return None
+    if not lecture.raw_transcript_path:
+        return "교정 안 됨(구버전)"
+    if lecture.transcript_path == lecture.raw_transcript_path:
+        return "교정 전"
+    return None
+
+
 class LectureItemDelegate(QStyledItemDelegate):
     """Draws a lecture row as a title line with a dimmer date/state line under
     it. The default delegate renders both lines in one colour and size, which
@@ -177,6 +206,26 @@ class LectureItemDelegate(QStyledItemDelegate):
     TITLE_COLOR_SELECTED = QColor("#1F55CB")
     META_COLOR = QColor("#8A94A6")
     META_COLOR_SELECTED = QColor("#5478C6")
+    SELECTED_BG = QColor("#E6EEFF")
+    HOVER_BG = QColor("#F2F5FA")
+
+    def _paint_row_background(self, painter, opt):
+        """Rounded highlight over the text cell only. Done here instead of in
+        the stylesheet because a QSS ::item background is also painted across
+        the indent gutter, which showed up as a detached block on the left."""
+        if opt.state & QStyle.State_Selected:
+            color = self.SELECTED_BG
+        elif opt.state & QStyle.State_MouseOver:
+            color = self.HOVER_BG
+        else:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawRoundedRect(QRectF(opt.rect).adjusted(0, 2, 0, -2), 8, 8)
+        painter.restore()
 
     def _meta_font(self, base: QFont) -> QFont:
         meta = QFont(base)
@@ -189,20 +238,21 @@ class LectureItemDelegate(QStyledItemDelegate):
         return title, meta
 
     def paint(self, painter, option, index):
-        # Month headers keep the plain single-line rendering.
-        if not index.parent().isValid():
-            super().paint(painter, option, index)
-            return
-
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         widget = opt.widget
         style = widget.style() if widget else QApplication.style()
 
-        # Let the stylesheet paint the row (hover, selection, rounded corners)
-        # but not the text -- the two lines are drawn by hand below.
+        self._paint_row_background(painter, opt)
+
+        # Month headers keep the plain single-line rendering, on top of the
+        # highlight drawn above.
+        if not index.parent().isValid():
+            super().paint(painter, option, index)
+            return
+
+        # The two text lines are drawn by hand below.
         opt.text = ""
-        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
 
         title, meta = self._split(index)
         rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget)
@@ -339,7 +389,7 @@ class ProcessingWorker(CancellableWorker):
 
     def _stt_progress(self, fraction: float):
         self._stop_if_cancelled()
-        self.progress.emit("음성 인식 중...", int(fraction * 60))
+        self.progress.emit("음성 인식 중...", int(fraction * 50))
 
     def run(self):
         try:
@@ -350,17 +400,49 @@ class ProcessingWorker(CancellableWorker):
             self.progress.emit("음성 인식 중...", 0)
             transcriber = Transcriber()
             self._stop_if_cancelled()
-            transcript = transcriber.transcribe(self.audio_path, progress_cb=self._stt_progress)
+            result = transcriber.transcribe(
+                self.audio_path, progress_cb=self._stt_progress, hotwords=glossary.hotwords_string()
+            )
             TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-            transcript_path = TRANSCRIPTS_DIR / f"{file_stem}.txt"
-            transcript_path.write_text(transcript, encoding="utf-8")
-            db.update_transcript(self.lecture_id, str(transcript_path))
+            # Raw STT output + per-word confidence are kept for the "애매한 단어
+            # 검토" feature -- the corrected transcript below is what's actually
+            # shown/summarized.
+            raw_transcript_path = TRANSCRIPTS_DIR / f"{file_stem}_raw.txt"
+            raw_transcript_path.write_text(result.text, encoding="utf-8")
+            words_path = TRANSCRIPTS_DIR / f"{file_stem}_words.json"
+            save_words(words_path, result.words)
+            # Recorded as the transcript right away (pointing at the raw text
+            # for now) so that if correction/summary fails below, retrying
+            # doesn't re-run STT -- retry_lecture only redoes STT when
+            # transcript_path is entirely unset.
+            db.update_transcript(self.lecture_id, str(raw_transcript_path), str(raw_transcript_path), str(words_path))
 
             self._stop_if_cancelled()
-            self.progress.emit("요약 정리 중...", 70)
+            self.progress.emit("녹취록 교정 중...", 50)
+            material_text = materials.load_materials_text(lecture.material_path if lecture else None)
+            corrector = TranscriptCorrector()
+            corrected_text = corrector.correct(
+                result.text,
+                glossary_terms=glossary.load_glossary(),
+                on_delta=self._summary_progress("녹취록 교정 중...", 50),
+                material_text=material_text,
+            )
+            transcript_path = TRANSCRIPTS_DIR / f"{file_stem}.txt"
+            transcript_path.write_text(corrected_text, encoding="utf-8")
+            db.update_transcript(
+                self.lecture_id, str(transcript_path), str(raw_transcript_path), str(words_path)
+            )
+            term_stats.collect_from_correction(self.lecture_id, result.text, corrected_text)
+
+            self._stop_if_cancelled()
+            self._last_reported_chars = 0  # _summary_progress's counter, reused for this 2nd stream
+            self.progress.emit("요약 정리 중...", 78)
             summarizer = Summarizer()
             summary = summarizer.summarize(
-                transcript, self.title, on_delta=self._summary_progress("요약 정리 중...", 70)
+                corrected_text,
+                self.title,
+                on_delta=self._summary_progress("요약 정리 중...", 78),
+                material_text=material_text,
             )
             SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
             summary_path = SUMMARIES_DIR / f"{file_stem}.md"
@@ -392,9 +474,13 @@ class SummaryWorker(CancellableWorker):
             self.progress.emit("요약 다시 생성 중...", 20)
             transcript = self.transcript_path.read_text(encoding="utf-8")
             self._stop_if_cancelled()
+            lecture = db.get_lecture(self.lecture_id)
             summarizer = Summarizer()
             summary = summarizer.summarize(
-                transcript, self.title, on_delta=self._summary_progress("요약 다시 생성 중...", 20)
+                transcript,
+                self.title,
+                on_delta=self._summary_progress("요약 다시 생성 중...", 20),
+                material_text=materials.load_materials_text(lecture.material_path if lecture else None),
             )
             self.summary_path.parent.mkdir(parents=True, exist_ok=True)
             self.summary_path.write_text(summary, encoding="utf-8")
@@ -404,6 +490,65 @@ class SummaryWorker(CancellableWorker):
             self.finished_ok.emit(self.lecture_id)
         except ProcessingCancelled:
             # The existing summary (if any) is untouched, so nothing to undo.
+            self.cancelled.emit(self.lecture_id)
+        except Exception as exc:
+            db.mark_failed(self.lecture_id)
+            self.failed.emit(self.lecture_id, str(exc))
+
+
+class CorrectTranscriptWorker(CancellableWorker):
+    """Runs just the correction pass against an already-existing transcript --
+    no audio needed. For lectures processed before the correction step
+    existed, or to re-run it after the glossary picked up new terms."""
+
+    def __init__(self, lecture_id: int, transcript_path: Path, title: str):
+        super().__init__(lecture_id)
+        self.transcript_path = transcript_path
+        self.title = title
+
+    def run(self):
+        try:
+            lecture = db.get_lecture(self.lecture_id)
+            existing_raw = (
+                Path(lecture.raw_transcript_path)
+                if lecture and lecture.raw_transcript_path and Path(lecture.raw_transcript_path).is_file()
+                else None
+            )
+
+            if existing_raw is not None:
+                # Already went through the normal pipeline before -- re-correct
+                # from the true original STT output, not from a previous
+                # correction, so repeated runs don't compound edits.
+                raw_transcript_path = existing_raw
+                source_text = raw_transcript_path.read_text(encoding="utf-8")
+            else:
+                # Pre-dates the correction feature: what's on disk now is the
+                # only copy there is. Keep it as the reference "raw" version
+                # before overwriting the transcript with the corrected text.
+                source_text = self.transcript_path.read_text(encoding="utf-8")
+                raw_transcript_path = self.transcript_path.with_name(
+                    self.transcript_path.stem + "_raw" + self.transcript_path.suffix
+                )
+                if not raw_transcript_path.is_file():
+                    raw_transcript_path.write_text(source_text, encoding="utf-8")
+
+            self._stop_if_cancelled()
+            self.progress.emit("녹취록 교정 중...", 10)
+            corrector = TranscriptCorrector()
+            corrected_text = corrector.correct(
+                source_text,
+                glossary_terms=glossary.load_glossary(),
+                on_delta=self._summary_progress("녹취록 교정 중...", 10),
+                material_text=materials.load_materials_text(lecture.material_path if lecture else None),
+            )
+            self.transcript_path.write_text(corrected_text, encoding="utf-8")
+            term_stats.collect_from_correction(self.lecture_id, source_text, corrected_text)
+            words_path = lecture.words_path if lecture else None
+            db.update_transcript(self.lecture_id, str(self.transcript_path), str(raw_transcript_path), words_path)
+
+            self.progress.emit("완료", 100)
+            self.finished_ok.emit(self.lecture_id)
+        except ProcessingCancelled:
             self.cancelled.emit(self.lecture_id)
         except Exception as exc:
             db.mark_failed(self.lecture_id)
@@ -592,6 +737,296 @@ class ScheduleDialog(QDialog):
         save_schedule(self.schedule)
 
 
+class GlossaryDialog(QDialog):
+    """강의에서 자주 나오는 전문용어/영어 약어 목록. 음성 인식(hotwords)과 녹취록
+    교정 단계 양쪽에 그대로 전달되어, 같은 용어가 반복해서 깨지는 걸 줄입니다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("용어집 관리")
+        self.setMinimumSize(440, 480)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        title_label = QLabel("용어집 관리")
+        title_label.setObjectName("lectureTitle")
+        layout.addWidget(title_label)
+
+        hint_label = QLabel(
+            "강의에서 자주 나오는 전문용어·영어 약어를 한 줄에 하나씩 등록하세요. "
+            "음성 인식 정확도를 올리고, 녹취록 교정 시에도 참고합니다.\n"
+            "예: Precision, Recall, AUC, ROC Curve, Confusion Matrix, predict_proba, scikit-learn"
+        )
+        hint_label.setObjectName("recordHint")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlainText("\n".join(glossary.load_glossary()))
+        self.text_edit.setPlaceholderText("Precision\nRecall\nAUC\nConfusion Matrix\n...")
+        layout.addWidget(self.text_edit, 1)
+
+        # Terms the app added on its own (corrected in several lectures) are
+        # named here so a wrong one is easy to spot and delete above.
+        auto_terms = sorted(term_stats.auto_added_terms())
+        if auto_terms:
+            auto_label = QLabel(
+                f"자동 등록된 용어 ({len(auto_terms)}개): " + ", ".join(auto_terms) + "\n"
+                f"{term_stats.PROMOTE_AFTER_LECTURES}개 이상의 강의에서 반복해서 교정된 "
+                "단어가 자동으로 등록됩니다. 잘못 등록된 게 있으면 위 목록에서 지우세요."
+            )
+            auto_label.setObjectName("recordHint")
+            auto_label.setWordWrap(True)
+            layout.addWidget(auto_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("취소")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("저장")
+        save_btn.setProperty("variant", "primary")
+        save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def save(self):
+        terms = [line.strip() for line in self.text_edit.toPlainText().splitlines()]
+        glossary.save_glossary([t for t in terms if t])
+
+
+class TermReviewLoader(QThread):
+    """Reads the raw STT word-confidence data and asks Claude for correction
+    candidates -- both take a moment, so this runs off the UI thread."""
+
+    loaded = Signal(list)  # list[FlaggedWord]
+    failed = Signal(str)
+
+    def __init__(self, lecture_id: int):
+        super().__init__()
+        self.lecture_id = lecture_id
+
+    def run(self):
+        try:
+            lecture = db.get_lecture(self.lecture_id)
+            if lecture is None or not lecture.words_path or not lecture.raw_transcript_path:
+                self.loaded.emit([])
+                return
+
+            words = load_words(Path(lecture.words_path))
+            raw_lines = Path(lecture.raw_transcript_path).read_text(encoding="utf-8").splitlines()
+            flagged = find_ambiguous_words(words, raw_lines)
+            generate_candidates(flagged, glossary.load_glossary())
+            self.loaded.emit(flagged)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class TermReviewDialog(QDialog):
+    """음성 인식 신뢰도가 낮았던 단어를 모아 보여주고, 문맥과 후보를 참고해
+    확정/직접 입력으로 교정합니다. 확정한 교정은 녹취록에 반영되고 용어집에도
+    추가되어, 다음 강의부터 같은 단어의 인식 정확도가 올라갑니다."""
+
+    def __init__(self, lecture_id: int, parent=None):
+        super().__init__(parent)
+        self.lecture_id = lecture_id
+        self.flagged: list[FlaggedWord] = []
+        self.current: FlaggedWord | None = None
+        self.corrected_lines: list[str] = []
+        self.raw_lines: list[str] = []
+        self.resolved: set[str] = set()
+        self.dirty = False
+
+        self.setWindowTitle("애매한 단어 검토")
+        self.setMinimumSize(780, 540)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        title_label = QLabel("애매한 단어 검토")
+        title_label.setObjectName("lectureTitle")
+        layout.addWidget(title_label)
+
+        self.status_label = QLabel("분석 중입니다...")
+        self.status_label.setObjectName("recordHint")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+
+        self.word_tree = QTreeWidget()
+        self.word_tree.setHeaderHidden(True)
+        self.word_tree.setMaximumWidth(260)
+        self.word_tree.currentItemChanged.connect(self._on_word_selected)
+        body.addWidget(self.word_tree)
+
+        detail = QVBoxLayout()
+        detail.setSpacing(8)
+
+        self.sentence_label = QLabel("왼쪽 목록에서 단어를 선택하세요.")
+        self.sentence_label.setWordWrap(True)
+        self.sentence_label.setObjectName("recordHint")
+        detail.addWidget(self.sentence_label)
+
+        candidate_label = QLabel("후보")
+        candidate_label.setObjectName("sectionLabel")
+        detail.addWidget(candidate_label)
+        self.candidate_row = QHBoxLayout()
+        self.candidate_row.setSpacing(8)
+        detail.addLayout(self.candidate_row)
+
+        custom_row = QHBoxLayout()
+        self.custom_edit = QLineEdit()
+        self.custom_edit.setPlaceholderText("후보에 없으면 직접 입력")
+        custom_row.addWidget(self.custom_edit, 1)
+        apply_custom_btn = QPushButton("이걸로 확정")
+        apply_custom_btn.setProperty("variant", "primary")
+        apply_custom_btn.clicked.connect(self._apply_custom)
+        custom_row.addWidget(apply_custom_btn)
+        detail.addLayout(custom_row)
+
+        skip_btn = QPushButton("이 단어는 건너뛰기")
+        skip_btn.clicked.connect(self._skip_current)
+        detail.addWidget(skip_btn)
+
+        detail.addStretch()
+        body.addLayout(detail, 1)
+        layout.addLayout(body, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        self.save_btn = QPushButton("저장하고 닫기")
+        self.save_btn.setProperty("variant", "primary")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._save_and_close)
+        btn_row.addWidget(self.save_btn)
+        layout.addLayout(btn_row)
+
+        self.loader = TermReviewLoader(lecture_id)
+        self.loader.loaded.connect(self._on_loaded)
+        self.loader.failed.connect(self._on_load_failed)
+        self.loader.start()
+
+    def _on_load_failed(self, message: str):
+        self.status_label.setText(f"분석에 실패했습니다: {message}")
+
+    def _on_loaded(self, flagged: list):
+        lecture = db.get_lecture(self.lecture_id)
+        if lecture is None or not lecture.transcript_path:
+            self.status_label.setText("녹취록을 찾을 수 없습니다.")
+            return
+        self.corrected_lines = Path(lecture.transcript_path).read_text(encoding="utf-8").splitlines()
+
+        if not flagged:
+            self.status_label.setText(
+                "검토할 만큼 애매한 단어가 없습니다 (또는 이 강의는 예전 버전으로 처리되어 "
+                "분석 데이터가 없습니다)."
+            )
+            return
+
+        self.flagged = flagged
+        self.status_label.setText(f"신뢰도가 낮았던 단어 {len(flagged)}개를 찾았습니다. 하나씩 확인해보세요.")
+
+        for f in self.flagged:
+            item = QTreeWidgetItem([f"{f.word}  ({f.count}회)"])
+            item.setData(0, WORD_ROLE, f.word)
+            self.word_tree.addTopLevelItem(item)
+
+        if self.word_tree.topLevelItemCount():
+            self.word_tree.setCurrentItem(self.word_tree.topLevelItem(0))
+
+    def _find_flagged(self, word: str) -> FlaggedWord | None:
+        return next((f for f in self.flagged if f.word == word), None)
+
+    def _on_word_selected(self, current: QTreeWidgetItem, _previous):
+        self._clear_candidates()
+        if current is None:
+            self.current = None
+            return
+        word = current.data(0, WORD_ROLE)
+        self.current = self._find_flagged(word)
+        if self.current is None:
+            return
+
+        lines = []
+        for occ in self.current.occurrences:
+            corrected = (
+                self.corrected_lines[occ.segment_index]
+                if occ.segment_index < len(self.corrected_lines)
+                else occ.sentence
+            )
+            lines.append(f"음성인식 원문: {occ.sentence}")
+            lines.append(f"현재 녹취록: {corrected}")
+            lines.append("")
+        resolved_note = " (처리됨)" if self.current.word in self.resolved else ""
+        self.sentence_label.setText(f"'{self.current.word}'{resolved_note}\n\n" + "\n".join(lines).strip())
+
+        for candidate in self.current.candidates:
+            btn = QPushButton(candidate)
+            btn.clicked.connect(lambda _checked, c=candidate: self._apply(c))
+            self.candidate_row.addWidget(btn)
+
+    def _clear_candidates(self):
+        while self.candidate_row.count():
+            item = self.candidate_row.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.custom_edit.clear()
+
+    def _apply_custom(self):
+        text = self.custom_edit.text().strip()
+        if text:
+            self._apply(text)
+
+    def _apply(self, replacement: str):
+        if self.current is None:
+            return
+        for occ in self.current.occurrences:
+            if occ.segment_index >= len(self.corrected_lines):
+                continue
+            line = self.corrected_lines[occ.segment_index]
+            if self.current.word in line:
+                self.corrected_lines[occ.segment_index] = line.replace(self.current.word, replacement)
+
+        glossary.add_terms([replacement])
+        self.resolved.add(self.current.word)
+        self.dirty = True
+        self.save_btn.setEnabled(True)
+        self._move_to_next_unresolved()
+
+    def _skip_current(self):
+        if self.current is not None:
+            self.resolved.add(self.current.word)
+        self._move_to_next_unresolved()
+
+    def _move_to_next_unresolved(self):
+        current_index = self.word_tree.indexOfTopLevelItem(self.word_tree.currentItem())
+        for i in range(current_index + 1, self.word_tree.topLevelItemCount()):
+            item = self.word_tree.topLevelItem(i)
+            if item.data(0, WORD_ROLE) not in self.resolved:
+                self.word_tree.setCurrentItem(item)
+                return
+        self.sentence_label.setText("남은 단어를 모두 확인했습니다. '저장하고 닫기'를 눌러 반영하세요.")
+        self._clear_candidates()
+
+    def _save_and_close(self):
+        lecture = db.get_lecture(self.lecture_id)
+        if lecture and lecture.transcript_path:
+            Path(lecture.transcript_path).write_text("\n".join(self.corrected_lines), encoding="utf-8")
+            db.update_transcript_path(self.lecture_id, lecture.transcript_path)
+        self.accept()
+
+
 class AutoRecordStatusDialog(QDialog):
     """실시간 자동 녹음 상태 확인 + 제어(일시정지/다시 시작/지금 종료), 최근 실패 항목 재시도.
     모달로 띄우지 않아 열어둔 채로 다른 작업을 계속할 수 있습니다."""
@@ -626,6 +1061,26 @@ class AutoRecordStatusDialog(QDialog):
         layout.addLayout(btn_row)
 
         layout.addSpacing(10)
+        material_header = QLabel("오늘 강의 자료")
+        material_header.setObjectName("sectionLabel")
+        layout.addWidget(material_header)
+
+        self.material_label = QLabel("")
+        self.material_label.setObjectName("recordHint")
+        self.material_label.setWordWrap(True)
+        layout.addWidget(self.material_label)
+
+        material_row = QHBoxLayout()
+        self.material_btn = QPushButton("자료 추가")
+        self.material_btn.clicked.connect(self._pick_day_materials)
+        material_row.addWidget(self.material_btn)
+        self.material_clear_btn = QPushButton("전체 해제")
+        self.material_clear_btn.clicked.connect(self._clear_day_materials)
+        material_row.addWidget(self.material_clear_btn)
+        material_row.addStretch()
+        layout.addLayout(material_row)
+
+        layout.addSpacing(10)
         failed_header = QLabel("최근 실패 항목")
         failed_header.setObjectName("sectionLabel")
         layout.addWidget(failed_header)
@@ -658,7 +1113,67 @@ class AutoRecordStatusDialog(QDialog):
         self.controller.stop_now()
         self._refresh()
 
+    def _today_iso(self) -> str:
+        return datetime.now(KST).date().isoformat()
+
+    def _pick_day_materials(self):
+        today = self._today_iso()
+        room = materials.MAX_MATERIALS - len(materials.get_day_materials(today))
+        if room <= 0:
+            QMessageBox.information(
+                self,
+                "자료 추가 불가",
+                f"강의 자료는 최대 {materials.MAX_MATERIALS}개까지 등록할 수 있습니다.\n"
+                "'전체 해제' 후 다시 등록해 주세요.",
+            )
+            return
+
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"오늘 강의 자료 선택 ({room}개 더 추가 가능)",
+            "",
+            "강의 자료 (*.ipynb *.py *.md *.txt);;모든 파일 (*.*)",
+        )
+        if not file_paths:
+            return
+
+        try:
+            materials.add_day_materials(today, [Path(p) for p in file_paths])
+        except OSError as exc:
+            QMessageBox.warning(self, "자료 등록 실패", str(exc))
+            return
+
+        if len(file_paths) > room:
+            QMessageBox.information(
+                self,
+                "일부만 등록됨",
+                f"최대 {materials.MAX_MATERIALS}개까지만 등록할 수 있어 앞의 {room}개만 추가했습니다.",
+            )
+        self._refresh_material_row()
+
+    def _clear_day_materials(self):
+        materials.clear_day_materials()
+        self._refresh_material_row()
+
+    def _refresh_material_row(self):
+        stored = materials.get_day_materials(self._today_iso())
+        if stored:
+            names = ", ".join(Path(path).name for path in stored)
+            self.material_label.setText(
+                f"등록됨 ({len(stored)}/{materials.MAX_MATERIALS}개): {names}\n"
+                "오늘 녹음되는 강의에 자동으로 첨부되어, 첫 교정·요약부터 반영됩니다."
+            )
+            self.material_clear_btn.setEnabled(True)
+        else:
+            self.material_label.setText(
+                "오늘 수업의 강의안·실습 파일(.ipynb 등)을 미리 등록해두면, 이후 녹음되는 "
+                f"강의에 자동으로 첨부되어 교정·요약 정확도가 올라갑니다. 최대 "
+                f"{materials.MAX_MATERIALS}개까지 등록할 수 있습니다."
+            )
+            self.material_clear_btn.setEnabled(False)
+
     def _refresh(self):
+        self._refresh_material_row()
         ctrl = self.controller
         recording = ctrl.active_period is not None
 
@@ -1028,6 +1543,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction("자동 녹음 설정", self.open_schedule_settings)
         settings_menu.addAction("자동 녹음 상태", self.open_auto_status)
         settings_menu.addSeparator()
+        settings_menu.addAction("용어집 관리", self.open_glossary)
         settings_menu.addAction("GPU 가속 설정", self.open_gpu_setup)
         settings_menu.addAction("중복된 강의 정리", self.cleanup_duplicates)
         settings_btn.setMenu(settings_menu)
@@ -1172,6 +1688,11 @@ class MainWindow(QMainWindow):
         # the real state instead of the placeholder text.
         self.auto_controller.check_now()
 
+        # Self-heals rows where correction actually completed (a _raw.txt
+        # backup exists on disk) but the DB link never got saved -- cheap
+        # filename check, silent, no harm running it every launch.
+        db.backfill_raw_transcript_links()
+
         self._refresh_list()
 
         # Deferred so the main window is painted before the offer appears on top
@@ -1231,6 +1752,11 @@ class MainWindow(QMainWindow):
             dialog.save()
             self.auto_controller.check_now()
 
+    def open_glossary(self):
+        dialog = GlossaryDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            dialog.save()
+
     def open_gpu_setup(self):
         GpuSetupDialog(self).exec()
 
@@ -1261,7 +1787,14 @@ class MainWindow(QMainWindow):
         self.tray.showMessage("강의 노트", f"{period}교시 자동 녹음을 시작했습니다.", QSystemTrayIcon.Information, 3000)
 
     def _on_auto_period_stopped(self, period: int, audio_path: Path, title: str):
-        lecture_id = db.create_lecture(title, str(audio_path))
+        # Hash it like imports do, so "중복 정리" can spot a period that ended
+        # up recorded twice (e.g. the app restarted mid-period).
+        try:
+            content_hash = hash_file(audio_path)
+        except OSError:
+            content_hash = None
+        lecture_id = db.create_lecture(title, str(audio_path), content_hash)
+        self._link_day_material(lecture_id)
         self._refresh_list()
         self._process_lecture(lecture_id, audio_path, title)
         self.tray.showMessage(
@@ -1302,6 +1835,12 @@ class MainWindow(QMainWindow):
             for dt, lecture in entries:
                 day_label = f"{dt.month:02d}.{dt.day:02d}({WEEKDAYS_KR[dt.weekday()]})"
                 status_label = STATUS_LABELS.get(lecture.status, lecture.status)
+                correction_note = _correction_status_label(lecture)
+                if correction_note:
+                    status_label += f" · {correction_note}"
+                material_count = len(materials.decode_paths(lecture.material_path))
+                if material_count:
+                    status_label += f" · 자료 {material_count}개"
                 # Title on its own line so long lecture names stay readable,
                 # with date and state underneath.
                 child = QTreeWidgetItem([f"{lecture.title}\n{day_label} · {status_label}"])
@@ -1404,6 +1943,63 @@ class MainWindow(QMainWindow):
         summary_path = Path(lecture.summary_path) if lecture.summary_path else SUMMARIES_DIR / f"{transcript_path.stem}.md"
         self._enqueue_worker(SummaryWorker(lecture_id, transcript_path, summary_path, lecture.title))
 
+    def correct_transcript(self, lecture_id: int):
+        """녹음 파일 없이, 이미 있는 녹취록 텍스트만으로 교정을 실행합니다.
+        (오디오가 필요한 건 STT뿐이고, 교정은 텍스트만으로 가능합니다.)"""
+        error = self._queue_transcript_correction(lecture_id)
+        if error:
+            QMessageBox.warning(self, "교정 불가", error)
+
+    def _queue_transcript_correction(self, lecture_id: int) -> str | None:
+        """Returns None on success (queued), or a reason string if it
+        couldn't be queued -- lets bulk callers collect failures instead of
+        popping a warning dialog per lecture."""
+        lecture = db.get_lecture(lecture_id)
+        if lecture is None:
+            return "강의를 찾을 수 없습니다."
+        if not lecture.transcript_path or not Path(lecture.transcript_path).is_file():
+            return "먼저 녹취록이 있어야 교정할 수 있습니다."
+
+        transcript_path = Path(lecture.transcript_path)
+        self._enqueue_worker(CorrectTranscriptWorker(lecture_id, transcript_path, lecture.title))
+        if lecture.summary_path:
+            # transcript_path is re-read at run() time by SummaryWorker, so by
+            # the time this runs (after the correction above) it already has
+            # the corrected text -- the existing summary won't go stale.
+            summary_path = Path(lecture.summary_path)
+            self._enqueue_worker(SummaryWorker(lecture_id, transcript_path, summary_path, lecture.title))
+        return None
+
+    def bulk_correct_transcripts(self, lecture_ids: list[int]):
+        skipped: list[str] = []
+        queued = 0
+        for lecture_id in lecture_ids:
+            error = self._queue_transcript_correction(lecture_id)
+            if error:
+                lecture = db.get_lecture(lecture_id)
+                name = lecture.title if lecture else str(lecture_id)
+                skipped.append(f"- {name}: {error}")
+            else:
+                queued += 1
+
+        if queued:
+            self.status_label.setText(f"{queued}개 강의를 교정 대기열에 추가했습니다.")
+        if skipped:
+            QMessageBox.information(
+                self, "일부 건너뜀", f"다음 {len(skipped)}개는 교정할 수 없어 건너뛰었습니다:\n" + "\n".join(skipped)
+            )
+
+    def open_term_review(self, lecture_id: int):
+        dialog = TermReviewDialog(lecture_id, self)
+        dialog.exec()
+        if dialog.dirty:
+            self.show_lecture(self.list_widget.currentItem(), None)
+            QMessageBox.information(
+                self,
+                "용어 검토 완료",
+                "녹취록에 반영했습니다. 요약에도 반영하려면 '요약 다시 생성'을 눌러주세요.",
+            )
+
     def _lecture_item_at(self, pos) -> QTreeWidgetItem | None:
         """Find the lecture row under the cursor.
 
@@ -1469,6 +2065,33 @@ class MainWindow(QMainWindow):
             else:
                 regenerate_action = menu.addAction("요약 다시 생성")
                 regenerate_action.setData("regenerate")
+                correct_action = menu.addAction("녹취록 교정")
+                correct_action.setData("correct_transcript")
+            if lecture and lecture.words_path:
+                review_action = menu.addAction("애매한 단어 검토")
+                review_action.setData("review_terms")
+            attached = materials.decode_paths(lecture.material_path if lecture else None)
+            if len(attached) < materials.MAX_MATERIALS:
+                attach_action = menu.addAction(
+                    f"강의 자료 추가 ({len(attached)}/{materials.MAX_MATERIALS})"
+                    if attached
+                    else "강의 자료 첨부"
+                )
+                attach_action.setData("attach_material")
+            if attached:
+                detach_action = menu.addAction(f"강의 자료 제거 ({len(attached)}개)")
+                detach_action.setData("detach_material")
+            menu.addSeparator()
+        else:
+            # Multi-select: only actions that make sense applied to a batch.
+            # Correction doesn't need audio and is cheap to queue up for many
+            # lectures at once (e.g. everything still on "구버전").
+            bulk_correct_action = menu.addAction(f"선택한 {len(lecture_ids)}개 녹취록 교정")
+            bulk_correct_action.setData("bulk_correct_transcript")
+            # One notebook usually covers a whole day, so attaching it to every
+            # period of that day at once is the common case.
+            bulk_attach_action = menu.addAction(f"선택한 {len(lecture_ids)}개에 강의 자료 첨부")
+            bulk_attach_action.setData("bulk_attach_material")
             menu.addSeparator()
         delete_action = menu.addAction("삭제")
         delete_action.setData("delete")
@@ -1483,8 +2106,96 @@ class MainWindow(QMainWindow):
             self.rename_lecture(lecture_ids[0])
         elif kind == "regenerate":
             self.regenerate_summary(lecture_ids[0])
+        elif kind == "correct_transcript":
+            self.correct_transcript(lecture_ids[0])
+        elif kind == "bulk_correct_transcript":
+            self.bulk_correct_transcripts(lecture_ids)
         elif kind == "retry":
             self.retry_lecture(lecture_ids[0])
+        elif kind == "review_terms":
+            self.open_term_review(lecture_ids[0])
+        elif kind in ("attach_material", "bulk_attach_material"):
+            self.attach_material(lecture_ids)
+        elif kind == "detach_material":
+            self.detach_material(lecture_ids[0])
+
+    def attach_material(self, lecture_ids: list[int]):
+        """Links lecture handouts (usually the day's .ipynb files) to these
+        lectures. They become reference context for correction and
+        summarisation, which beats hand-collecting glossary terms during
+        class. Files add to whatever is already attached, up to the cap."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"강의 자료 선택 (최대 {materials.MAX_MATERIALS}개)",
+            "",
+            "강의 자료 (*.ipynb *.py *.md *.txt);;모든 파일 (*.*)",
+        )
+        if not file_paths:
+            return
+
+        sources = [Path(p) for p in file_paths]
+        skipped_full = 0
+        for lecture_id in lecture_ids:
+            lecture = db.get_lecture(lecture_id)
+            existing = materials.decode_paths(lecture.material_path if lecture else None)
+            room = materials.MAX_MATERIALS - len(existing)
+            if room <= 0:
+                skipped_full += 1
+                continue
+
+            for source in sources[:room]:
+                try:
+                    dest = materials.store_for_lecture(lecture_id, source)
+                except OSError as exc:
+                    QMessageBox.warning(self, "자료 첨부 실패", f"{source.name}: {exc}")
+                    return
+                if str(dest) not in existing:
+                    existing.append(str(dest))
+            db.update_material(lecture_id, materials.encode_paths(existing))
+
+        self._refresh_list()
+        names = ", ".join(source.name for source in sources)
+        extra = f"\n\n이미 {materials.MAX_MATERIALS}개가 첨부된 {skipped_full}개 강의는 건너뛰었습니다." if skipped_full else ""
+        QMessageBox.information(
+            self,
+            "강의 자료 첨부",
+            f"'{names}'을(를) {len(lecture_ids) - skipped_full}개 강의에 첨부했습니다.\n\n"
+            "이미 요약까지 끝난 강의라면 '녹취록 교정'을 다시 실행해야 자료가 반영됩니다."
+            f"{extra}",
+        )
+
+    def _link_day_material(self, lecture_id: int):
+        """Attaches the handouts registered for today, if any, at the moment
+        the lecture row is created -- so its first correction and summary
+        already use them instead of needing a second pass."""
+        stored = materials.get_day_materials(datetime.now(KST).date().isoformat())
+        if stored:
+            db.update_material(lecture_id, materials.encode_paths(stored))
+
+    def detach_material(self, lecture_id: int):
+        lecture = db.get_lecture(lecture_id)
+        if lecture is None or not lecture.material_path:
+            return
+
+        attached = materials.decode_paths(lecture.material_path)
+        db.update_material(lecture_id, None)
+
+        # Only our own copies under materials/ are removed -- never the files
+        # the user picked from their own folders -- and never one another
+        # lecture still points at (a day's handout is shared by its periods).
+        still_used: set[str] = set()
+        for other in db.list_lectures():
+            if other.id != lecture_id:
+                still_used.update(materials.decode_paths(other.material_path))
+
+        for path_str in attached:
+            stored = Path(path_str)
+            if stored.is_file() and stored.parent == MATERIALS_DIR and path_str not in still_used:
+                try:
+                    stored.unlink()
+                except OSError:
+                    pass
+        self._refresh_list()
 
     def delete_selected_lectures(self, lecture_ids: list[int] | None = None):
         if lecture_ids is None:
@@ -1512,12 +2223,35 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # Stop any queued/running job for these lectures first, so nothing
+        # keeps writing transcript or summary files for a row that's gone (and
+        # so the audio file isn't still held open when we try to delete it).
+        self._cancel_jobs_for({lecture.id for lecture in lectures})
+
+        undeleted: list[str] = []
         for lecture in lectures:
-            db.delete_lecture(lecture.id)
+            undeleted += db.delete_lecture(lecture.id)
         self._refresh_list()
         self.summary_view.clear()
         self.transcript_view.clear()
         self._reset_detail_header()
+
+        if undeleted:
+            files = "\n".join(f"- {Path(path).name}" for path in undeleted)
+            QMessageBox.information(
+                self,
+                "일부 파일 삭제 실패",
+                "목록에서는 삭제했지만, 아래 파일은 다른 작업이 사용 중이라 지우지 못했습니다.\n"
+                f"처리가 끝난 뒤 직접 삭제해 주세요.\n\n{files}",
+            )
+
+    def _cancel_jobs_for(self, lecture_ids: set[int]):
+        """Drops queued jobs for these lectures and asks a running one to stop."""
+        self._processing_queue = [
+            worker for worker in self._processing_queue if worker.lecture_id not in lecture_ids
+        ]
+        if self.worker is not None and self.worker.isRunning() and self.worker.lecture_id in lecture_ids:
+            self.worker.cancel()
 
     def cleanup_duplicates(self):
         db.backfill_content_hashes()
@@ -1559,6 +2293,7 @@ class MainWindow(QMainWindow):
             if dialog.exec() == QDialog.Accepted and dialog.audio_path:
                 title = dialog.result_title()
                 lecture_id = db.create_lecture(title, str(dialog.audio_path))
+                self._link_day_material(lecture_id)
                 self._refresh_list()
                 self._process_lecture(lecture_id, dialog.audio_path, title)
         finally:
@@ -1650,6 +2385,16 @@ class MainWindow(QMainWindow):
             self._start_next_in_queue()
 
     def _start_next_in_queue(self):
+        # finished_ok/failed/cancelled are emitted from inside the worker's
+        # run(), so its QThread hasn't actually exited yet when we get here.
+        # Rebinding self.worker below drops the last reference to it, and
+        # destroying a still-running QThread aborts the whole process (the app
+        # vanished with no error when a batch import started its next file).
+        # The signal comes at the very end of run(), so this wait is instant.
+        previous = self.worker
+        if previous is not None and previous.isRunning():
+            previous.wait()
+
         if not self._processing_queue:
             self._set_processing_ui(False)
             return
@@ -1730,12 +2475,23 @@ class MainWindow(QMainWindow):
         self._start_next_in_queue()
 
     def retry_lecture(self, lecture_id: int):
-        """녹취록이 이미 있으면 요약만, 없으면 원본 오디오부터 다시 처리합니다."""
+        """녹취록이 교정까지 끝나 있으면 요약만, 교정 전(원문) 상태면 교정부터,
+        녹취록 자체가 없으면 원본 오디오부터 다시 처리합니다."""
         lecture = db.get_lecture(lecture_id)
         if lecture is None:
             return
 
-        if lecture.transcript_path and Path(lecture.transcript_path).is_file():
+        has_transcript = lecture.transcript_path and Path(lecture.transcript_path).is_file()
+        stuck_at_raw = (
+            has_transcript and lecture.raw_transcript_path and lecture.transcript_path == lecture.raw_transcript_path
+        )
+        if stuck_at_raw:
+            # Failed during/after correction last time (e.g. API credit ran
+            # out) -- transcript_path still points at the raw text, so
+            # resuming with just a summary would summarize the uncorrected
+            # version. Redo the correction step first.
+            self.correct_transcript(lecture_id)
+        elif has_transcript:
             self.regenerate_summary(lecture_id)
         elif lecture.audio_path and Path(lecture.audio_path).is_file():
             self._process_lecture(lecture_id, Path(lecture.audio_path), lecture.title)
@@ -1754,6 +2510,9 @@ class MainWindow(QMainWindow):
 
         recorded_at = datetime.fromisoformat(lecture.recorded_at)
         status_label = STATUS_LABELS.get(lecture.status, lecture.status)
+        correction_note = _correction_status_label(lecture)
+        if correction_note:
+            status_label += f" · {correction_note} (원문 그대로)"
         self.lecture_title_label.setText(lecture.title)
         self.lecture_meta_label.setText(
             f"{recorded_at:%Y년 %m월 %d일 %H:%M} · {status_label}"

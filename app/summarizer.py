@@ -1,10 +1,6 @@
-import os
 from typing import Callable
 
-import anthropic
-from dotenv import load_dotenv
-
-from app.paths import ENV_PATH
+from app.anthropic_client import get_client
 
 MODEL = "claude-opus-5"
 
@@ -31,22 +27,14 @@ SYSTEM_PROMPT = """\
 
 class Summarizer:
     def __init__(self):
-        # Retry after the user drops a key into .env without restarting the app.
-        load_dotenv(ENV_PATH, override=True)
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError(
-                "Anthropic API 키가 없습니다. "
-                f"{ENV_PATH} 파일에 ANTHROPIC_API_KEY=sk-ant-... 한 줄을 넣은 뒤 "
-                "다시 시도하세요."
-            )
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = get_client()
 
     def summarize(
         self,
         transcript: str,
         title: str,
         on_delta: Callable[[int], None] | None = None,
+        material_text: str | None = None,
     ) -> str:
         """Streamed so the caller sees the summary growing and can stop it.
 
@@ -54,12 +42,26 @@ class Summarizer:
         raise to abort -- a single non-streamed request would otherwise keep
         the thread stuck until the whole answer came back.
         """
+        system = SYSTEM_PROMPT
+        if material_text:
+            # The day's own notebook: use it to get terminology and section
+            # names right, but the note must still describe what was actually
+            # said, not just restate the handout.
+            system += (
+                "\n\n아래는 이 강의에서 사용한 강의 자료입니다. 용어의 정확한 표기와 "
+                "주제 구성을 파악하는 데 참고하세요. 다만 노트는 어디까지나 녹취록에서 "
+                "실제로 다룬 내용을 정리해야 하며, 자료에만 있고 강의에서 다루지 않은 "
+                "내용을 채워 넣지 마세요.\n\n"
+                "===== 강의 자료 시작 =====\n"
+                f"{material_text}\n"
+                "===== 강의 자료 끝 =====")
+
         parts: list[str] = []
         written = 0
         with self.client.messages.stream(
             model=MODEL,
             max_tokens=16000,
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=[
                 {
                     "role": "user",
