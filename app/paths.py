@@ -34,6 +34,9 @@ SCHEDULE_PATH = DATA_DIR / "schedule.json"
 ENV_PATH = DATA_DIR / ".env"
 GLOSSARY_PATH = DATA_DIR / "glossary.json"
 TERM_STATS_PATH = DATA_DIR / "term_stats.json"
+# Learned "misheard -> correct" pairs, applied without an API call.
+REPLACEMENTS_PATH = DATA_DIR / "replacements.json"
+SETTINGS_PATH = DATA_DIR / "settings.json"
 # Material registered for a given day up front, so lectures auto-recorded that
 # day are linked to it the moment they're created.
 DAY_MATERIAL_PATH = DATA_DIR / "day_material.json"

@@ -12,6 +12,8 @@ lecture_notes.db
 schedule.json
 glossary.json
 term_stats.json
+replacements.json
+settings.json
 day_material.json
 crash.log
 materials/

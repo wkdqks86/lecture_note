@@ -1,5 +1,5 @@
 import shutil
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QRect, QRectF, QSize, QThread, Qt, QTimer, Signal
@@ -18,10 +18,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QStyle,
     QStyledItemDelegate,
@@ -43,7 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app import cuda_runtime, db, glossary, materials, term_stats
+from app import cuda_runtime, db, glossary, materials, replacements, settings, term_stats
 from app.auto_recorder import KST, AutoRecordController
 from app.cancellation import ProcessingCancelled
 from app.corrector import TranscriptCorrector
@@ -99,14 +102,20 @@ QLineEdit:focus, QTextEdit:focus, QTreeWidget:focus {
     border: 1px solid #4F7EF7;
 }
 QLineEdit { min-height: 30px; }
-/* The row highlight is painted by LectureItemDelegate, not from here: a
-   stylesheet ::item background also gets drawn across the tree's indent
-   gutter, which left a stray coloured block to the left of each row.
+QTreeWidget { padding: 5px; outline: 0; border-color: #E8ECF4; }
+QTreeWidget::item { padding: 0px 6px; margin: 2px 0; }
+/* The lecture list's row highlight is painted by LectureItemDelegate, not
+   from here: a stylesheet ::item background also gets drawn across the tree's
+   indent gutter, which left a stray coloured block to the left of each row.
    selection-background-color is cleared for the same reason (it is what the
    native style fills the gutter with), and ::branch is deliberately left
-   alone -- styling it at all makes Qt drop its expand/collapse arrow. */
-QTreeWidget { padding: 5px; outline: 0; border-color: #E8ECF4; selection-background-color: transparent; }
-QTreeWidget::item { padding: 0px 6px; margin: 2px 0; }
+   alone -- styling it at all makes Qt drop its expand/collapse arrow.
+   Both are scoped to that one list: every other tree is a plain flat table
+   with no delegate of its own, so clearing them there left selected rows
+   with no visible highlight at all. */
+QTreeWidget#lectureList { selection-background-color: transparent; }
+QTreeWidget#dataTree::item:selected { background: #E6EEFF; color: #1F55CB; }
+QTreeWidget#dataTree::item:hover { background: #F2F5FA; }
 QPushButton {
     background: #FFFFFF;
     border: 1px solid #D8DFEB;
@@ -171,6 +180,19 @@ STATUS_LABELS = {
     "summarized": "요약 완료",
     "failed": "처리 실패",
 }
+
+
+def _week_start(dt: datetime) -> date:
+    """The Monday of that lecture's week -- the key lectures are grouped by."""
+    return (dt - timedelta(days=dt.weekday())).date()
+
+
+def _week_label(monday: date, ordinal: int) -> str:
+    """`ordinal` counts weeks within the month group the row appears under, so
+    a week starting in the previous month (e.g. 08.31~09.06 under 9월) still
+    reads as that month's first week rather than the previous month's fifth."""
+    sunday = monday + timedelta(days=6)
+    return f"{ordinal}주차  ({monday:%m.%d}~{sunday:%m.%d})"
 
 
 def _correction_status_label(lecture: db.Lecture) -> str | None:
@@ -245,9 +267,10 @@ class LectureItemDelegate(QStyledItemDelegate):
 
         self._paint_row_background(painter, opt)
 
-        # Month headers keep the plain single-line rendering, on top of the
-        # highlight drawn above.
-        if not index.parent().isValid():
+        # Month and week headers keep the plain single-line rendering, on top
+        # of the highlight drawn above. Identified by having no lecture id
+        # rather than by depth, since headers now exist at two levels.
+        if index.data(LECTURE_ID_ROLE) is None:
             super().paint(painter, option, index)
             return
 
@@ -295,7 +318,7 @@ class LectureItemDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index):
-        if not index.parent().isValid():
+        if index.data(LECTURE_ID_ROLE) is None:  # month/week header row
             return super().sizeHint(option, index)
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
@@ -333,6 +356,29 @@ def _build_app_icon(recording: bool = False, size: int = 64) -> QIcon:
         painter.drawEllipse(QRectF(40 * scale, 40 * scale, 20 * scale, 20 * scale))
     painter.end()
     return QIcon(pixmap)
+
+
+def _learn_from_correction(lecture_id: int, raw_text: str, corrected_text: str) -> None:
+    """Both things the app learns from a finished correction: glossary terms
+    (needs one small API call to normalise them) and the free, purely local
+    replacement pairs. Kept together so every correction path feeds both.
+
+    Never raises -- this runs after the work that mattered already succeeded."""
+    try:
+        pairs = term_stats.extract_corrections(raw_text, corrected_text)
+    except Exception:
+        return
+
+    try:
+        replacements.record(lecture_id, pairs, corrected_text=corrected_text)
+    except Exception:
+        pass
+
+    if settings.correction_mode() != "local" and settings.auto_summarize():
+        # Normalising the terms costs an API call, so it follows the same
+        # switch as the summary, and is skipped in local-only correction mode
+        # for the same reason that mode exists.
+        term_stats.collect_from_correction(lecture_id, raw_text, corrected_text)
 
 
 class CancellableWorker(QThread):
@@ -378,6 +424,33 @@ class CancellableWorker(QThread):
 
         return report
 
+    def _correct(self, source_text: str, lecture, base_percent: int) -> str:
+        """Correction as configured: learned replacements, Claude, or both.
+
+        The replacement pass costs nothing and runs in every mode -- it only
+        rewrites phrases this speaker has already had corrected the same way
+        in separate lectures, so it's strictly a head start for the API pass
+        when one follows."""
+        mode = settings.correction_mode()
+
+        text = source_text
+        if mode in ("local", "local_then_api"):
+            self.progress.emit("치환 사전 적용 중...", base_percent)
+            text, applied = replacements.apply(text)
+            if mode == "local":
+                self.progress.emit(f"치환 사전 적용 완료 ({applied}건)", base_percent)
+                return text
+
+        self._stop_if_cancelled()
+        self.progress.emit("녹취록 교정 중...", base_percent)
+        corrector = TranscriptCorrector()
+        return corrector.correct(
+            text,
+            glossary_terms=glossary.load_glossary(),
+            on_delta=self._summary_progress("녹취록 교정 중...", base_percent),
+            material_text=materials.load_materials_text(lecture.material_path if lecture else None),
+        )
+
 
 class ProcessingWorker(CancellableWorker):
     """Runs STT + summarization off the UI thread."""
@@ -418,23 +491,24 @@ class ProcessingWorker(CancellableWorker):
             db.update_transcript(self.lecture_id, str(raw_transcript_path), str(raw_transcript_path), str(words_path))
 
             self._stop_if_cancelled()
-            self.progress.emit("녹취록 교정 중...", 50)
             material_text = materials.load_materials_text(lecture.material_path if lecture else None)
-            corrector = TranscriptCorrector()
-            corrected_text = corrector.correct(
-                result.text,
-                glossary_terms=glossary.load_glossary(),
-                on_delta=self._summary_progress("녹취록 교정 중...", 50),
-                material_text=material_text,
-            )
+            corrected_text = self._correct(result.text, lecture, 50)
             transcript_path = TRANSCRIPTS_DIR / f"{file_stem}.txt"
             transcript_path.write_text(corrected_text, encoding="utf-8")
             db.update_transcript(
                 self.lecture_id, str(transcript_path), str(raw_transcript_path), str(words_path)
             )
-            term_stats.collect_from_correction(self.lecture_id, result.text, corrected_text)
+            _learn_from_correction(self.lecture_id, result.text, corrected_text)
 
             self._stop_if_cancelled()
+            if not settings.auto_summarize():
+                # Transcript-only mode: the lecture stays at "녹취 완료" and a
+                # summary can still be made later on demand ("요약 다시 생성"),
+                # or outside the app entirely.
+                self.progress.emit("완료 (요약 생략)", 100)
+                self.finished_ok.emit(self.lecture_id)
+                return
+
             self._last_reported_chars = 0  # _summary_progress's counter, reused for this 2nd stream
             self.progress.emit("요약 정리 중...", 78)
             summarizer = Summarizer()
@@ -533,16 +607,9 @@ class CorrectTranscriptWorker(CancellableWorker):
                     raw_transcript_path.write_text(source_text, encoding="utf-8")
 
             self._stop_if_cancelled()
-            self.progress.emit("녹취록 교정 중...", 10)
-            corrector = TranscriptCorrector()
-            corrected_text = corrector.correct(
-                source_text,
-                glossary_terms=glossary.load_glossary(),
-                on_delta=self._summary_progress("녹취록 교정 중...", 10),
-                material_text=materials.load_materials_text(lecture.material_path if lecture else None),
-            )
+            corrected_text = self._correct(source_text, lecture, 10)
             self.transcript_path.write_text(corrected_text, encoding="utf-8")
-            term_stats.collect_from_correction(self.lecture_id, source_text, corrected_text)
+            _learn_from_correction(self.lecture_id, source_text, corrected_text)
             words_path = lecture.words_path if lecture else None
             db.update_transcript(self.lecture_id, str(self.transcript_path), str(raw_transcript_path), words_path)
 
@@ -798,6 +865,252 @@ class GlossaryDialog(QDialog):
         glossary.save_glossary([t for t in terms if t])
 
 
+class ReplacementsDialog(QDialog):
+    """교정 방식 선택 + 자동으로 학습된 치환 사전 관리.
+
+    The dictionary is built from what Claude actually changed in past
+    corrections, so it can replace those API calls entirely for mistakes this
+    speaker/mic keeps making."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("교정 방식 · 치환 사전")
+        self.setMinimumSize(760, 640)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 22, 24, 22)
+        outer.setSpacing(10)
+
+        title_label = QLabel("교정 방식 · 치환 사전")
+        title_label.setObjectName("lectureTitle")
+        outer.addWidget(title_label)
+
+        tabs = QTabWidget()
+        outer.addWidget(tabs, 1)
+
+        # -- 교정 방식 tab -------------------------------------------------
+        settings_page = QWidget()
+        layout = QVBoxLayout(settings_page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
+        tabs.addTab(settings_page, "교정 방식")
+
+        mode_header = QLabel("교정 방식")
+        mode_header.setObjectName("sectionLabel")
+        layout.addWidget(mode_header)
+
+        current_mode = settings.correction_mode()
+        self.mode_buttons: dict[str, QRadioButton] = {}
+        for mode in settings.CORRECTION_MODES:
+            button = QRadioButton(settings.CORRECTION_MODE_LABELS[mode])
+            button.setChecked(mode == current_mode)
+            self.mode_buttons[mode] = button
+            layout.addWidget(button)
+
+        model_header = QLabel("교정에 사용할 모델")
+        model_header.setObjectName("sectionLabel")
+        layout.addWidget(model_header)
+
+        model_hint = QLabel(
+            "교정은 입력만큼 긴 글을 다시 써내는 단계라 비용의 대부분을 차지합니다. "
+            "요약은 판단이 필요하고 출력이 짧아 Opus로 고정되어 있습니다."
+        )
+        model_hint.setObjectName("recordHint")
+        model_hint.setWordWrap(True)
+        layout.addWidget(model_hint)
+
+        self.model_combo = QComboBox()
+        for model in settings.CORRECTION_MODELS:
+            self.model_combo.addItem(settings.CORRECTION_MODEL_LABELS[model], model)
+        current_model = settings.correction_model()
+        index = self.model_combo.findData(current_model)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+        layout.addWidget(self.model_combo)
+
+        stages_header = QLabel("녹취 이후 자동 단계")
+        stages_header.setObjectName("sectionLabel")
+        layout.addWidget(stages_header)
+
+        stages_hint = QLabel(
+            "음성 인식은 로컬 GPU에서 돌아가 비용이 들지 않습니다. 아래를 꺼도 "
+            "작업이 사라지는 게 아니라 미뤄질 뿐이며, 목록에서 우클릭해 "
+            "'녹취록 만들기'·'요약 다시 생성'으로 언제든 실행할 수 있습니다.\n"
+            "API 없이 녹취록만 자동으로 만들려면: 아래 첫 항목은 켜두고, 위 교정 방식을 "
+            "'치환 사전만'으로, 요약은 끄시면 됩니다."
+        )
+        stages_hint.setObjectName("recordHint")
+        stages_hint.setWordWrap(True)
+        layout.addWidget(stages_hint)
+
+        self.transcribe_check = QCheckBox(
+            "녹음이 끝나면 바로 녹취록 만들기 — 끄면 녹음만 저장됩니다 (음성 인식 + 교정)"
+        )
+        self.transcribe_check.setChecked(settings.auto_transcribe())
+        layout.addWidget(self.transcribe_check)
+
+        self.summarize_check = QCheckBox("요약 노트·용어집 자동 생성 (강의당 약 $0.17)")
+        self.summarize_check.setChecked(settings.auto_summarize())
+        layout.addWidget(self.summarize_check)
+        layout.addStretch()
+
+        # -- 치환 사전 tab -------------------------------------------------
+        dict_page = QWidget()
+        dict_layout = QVBoxLayout(dict_page)
+        dict_layout.setContentsMargins(4, 12, 4, 4)
+        dict_layout.setSpacing(10)
+        tabs.addTab(dict_page, "치환 사전")
+
+        hint_label = QLabel(
+            "지난 교정에서 Claude가 실제로 고친 내용을 모아 '잘못 들린 말 → 올바른 말' 사전을 "
+            f"만듭니다. 서로 다른 강의 {replacements.PROMOTE_AFTER_LECTURES}개에서 똑같이 고쳐진 "
+            "표현만 사전에 올라가고, 강의마다 다르게 고쳐진 표현이나 정상 단어로도 쓰이는 표현은 "
+            "자동으로 제외됩니다."
+        )
+        hint_label.setObjectName("recordHint")
+        hint_label.setWordWrap(True)
+        dict_layout.addWidget(hint_label)
+
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("dataTree")
+        self.tree.setHeaderLabels(["잘못 들린 말", "고칠 말", "강의 수", "상태"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        dict_layout.addWidget(self.tree, 1)
+
+        row = QHBoxLayout()
+        self.toggle_btn = QPushButton("사용 안 함으로 전환")
+        self.toggle_btn.clicked.connect(self._toggle_selected)
+        row.addWidget(self.toggle_btn)
+        self.forget_btn = QPushButton("사전에서 삭제")
+        self.forget_btn.clicked.connect(self._forget_selected)
+        row.addWidget(self.forget_btn)
+        row.addStretch()
+        self.learn_btn = QPushButton("기존 교정 기록에서 학습")
+        self.learn_btn.setToolTip("이미 교정을 마친 강의들의 원문과 교정본을 비교해 사전을 채웁니다.")
+        self.learn_btn.clicked.connect(self._learn_from_history)
+        row.addWidget(self.learn_btn)
+        dict_layout.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("취소")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("저장")
+        save_btn.setProperty("variant", "primary")
+        save_btn.clicked.connect(self.accept)
+        btn_row.addWidget(save_btn)
+        outer.addLayout(btn_row)
+
+        self._reload()
+
+    def _reload(self):
+        self.tree.clear()
+        for entry in replacements.all_entries():
+            if entry["ambiguous"]:
+                state = "제외됨 (강의마다 다르게 교정)"
+            elif entry["also_valid"]:
+                state = "제외됨 (정상 단어로도 쓰임)"
+            elif entry["disabled_by_user"]:
+                state = "사용 안 함"
+            elif entry["active"]:
+                state = "사용 중"
+            else:
+                state = f"관찰 중 ({entry['lectures']}/{replacements.PROMOTE_AFTER_LECTURES})"
+            item = QTreeWidgetItem(
+                [entry["before"], entry["after"], str(entry["lectures"]), state]
+            )
+            item.setData(0, LECTURE_ID_ROLE, entry["before"])
+            self.tree.addTopLevelItem(item)
+
+    def _selected_keys(self) -> list[str]:
+        return [item.data(0, LECTURE_ID_ROLE) for item in self.tree.selectedItems()]
+
+    def _toggle_selected(self):
+        entries = {entry["before"]: entry for entry in replacements.all_entries()}
+        for key in self._selected_keys():
+            entry = entries.get(key)
+            if entry is not None:
+                replacements.set_disabled(key, not entry["disabled_by_user"])
+        self._reload()
+
+    def _forget_selected(self):
+        keys = self._selected_keys()
+        if not keys:
+            return
+        reply = QMessageBox.question(
+            self,
+            "삭제 확인",
+            f"선택한 {len(keys)}개 항목을 사전에서 삭제할까요?\n"
+            "이후 교정에서 같은 표현이 다시 관찰되면 새로 학습됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for key in keys:
+            replacements.forget(key)
+        self._reload()
+
+    def _learn_from_history(self):
+        """Builds the dictionary from corrections that already happened.
+
+        Every lecture that went through correction kept its pre-correction
+        text as `_raw.txt`, so the pairs are all sitting on disk -- no reason
+        to make the user wait for two more lectures to get a usable dictionary."""
+        scanned = 0
+        for lecture in db.list_lectures():
+            raw_path = lecture.raw_transcript_path
+            corrected_path = lecture.transcript_path
+            if not raw_path or not corrected_path or raw_path == corrected_path:
+                continue
+            raw_file, corrected_file = Path(raw_path), Path(corrected_path)
+            if not raw_file.is_file() or not corrected_file.is_file():
+                continue
+            try:
+                corrected_text = corrected_file.read_text(encoding="utf-8")
+                pairs = term_stats.extract_corrections(
+                    raw_file.read_text(encoding="utf-8"), corrected_text
+                )
+            except OSError:
+                continue
+            scanned += 1
+            replacements.record(lecture.id, pairs, corrected_text=corrected_text)
+
+        self._reload()
+        # Counted from the final state, not from how many were activated along
+        # the way: a pair activated early can be switched off again by a later
+        # lecture that shows the same phrase standing as a valid word.
+        entries = replacements.all_entries()
+        active = sum(1 for entry in entries if entry["active"])
+        QMessageBox.information(
+            self,
+            "학습 완료",
+            f"교정 기록이 있는 강의 {scanned}건에서 표현 {len(entries)}개를 확인했습니다.\n\n"
+            f"지금 사용 중인 치환 항목: {active}개\n"
+            "나머지는 아직 관찰 중이거나, 문맥을 타서 자동 제외된 항목입니다.",
+        )
+
+    def save(self):
+        values = {
+            "correction_model": self.model_combo.currentData(),
+            "auto_transcribe": self.transcribe_check.isChecked(),
+            "auto_summarize": self.summarize_check.isChecked(),
+        }
+        for mode, button in self.mode_buttons.items():
+            if button.isChecked():
+                values["correction_mode"] = mode
+                break
+        settings.save(values)
+
+
 class TermReviewLoader(QThread):
     """Reads the raw STT word-confidence data and asks Claude for correction
     candidates -- both take a moment, so this runs off the UI thread."""
@@ -861,7 +1174,9 @@ class TermReviewDialog(QDialog):
         body.setSpacing(16)
 
         self.word_tree = QTreeWidget()
+        self.word_tree.setObjectName("dataTree")
         self.word_tree.setHeaderHidden(True)
+        self.word_tree.setRootIsDecorated(False)  # flat list -- no indent gutter to reserve
         self.word_tree.setMaximumWidth(260)
         self.word_tree.currentItemChanged.connect(self._on_word_selected)
         body.addWidget(self.word_tree)
@@ -1544,6 +1859,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction("자동 녹음 상태", self.open_auto_status)
         settings_menu.addSeparator()
         settings_menu.addAction("용어집 관리", self.open_glossary)
+        settings_menu.addAction("교정 방식 · 치환 사전", self.open_replacements)
         settings_menu.addAction("GPU 가속 설정", self.open_gpu_setup)
         settings_menu.addAction("중복된 강의 정리", self.cleanup_duplicates)
         settings_btn.setMenu(settings_menu)
@@ -1590,6 +1906,7 @@ class MainWindow(QMainWindow):
         self._search_timer.timeout.connect(self._apply_search_filter)
 
         self.list_widget = QTreeWidget()
+        self.list_widget.setObjectName("lectureList")
         self.list_widget.setHeaderHidden(True)
         self.list_widget.setItemDelegate(LectureItemDelegate(self.list_widget))
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1757,6 +2074,11 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             dialog.save()
 
+    def open_replacements(self):
+        dialog = ReplacementsDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            dialog.save()
+
     def open_gpu_setup(self):
         GpuSetupDialog(self).exec()
 
@@ -1814,38 +2136,51 @@ class MainWindow(QMainWindow):
     def _refresh_list(self):
         self.list_widget.clear()
 
-        month_groups: dict[str, list[tuple[datetime, db.Lecture]]] = {}
+        # month -> week -> lectures. A bootcamp runs eight periods a day, so a
+        # month header alone opens onto ~150 rows; the week level keeps a day's
+        # worth of lectures within reach.
+        month_groups: dict[str, dict[date, list[tuple[datetime, db.Lecture]]]] = {}
         total = 0
         for lecture in db.list_lectures():  # already sorted recorded_at DESC
             dt = datetime.fromisoformat(lecture.recorded_at)
             month_key = f"{dt.year}년 {dt.month}월"
-            month_groups.setdefault(month_key, []).append((dt, lecture))
+            month_groups.setdefault(month_key, {}).setdefault(_week_start(dt), []).append((dt, lecture))
             total += 1
         self.library_label.setText(f"전체 강의  {total}")
 
-        for i, (month_key, entries) in enumerate(month_groups.items()):
-            group_item = QTreeWidgetItem([f"{month_key}  ({len(entries)})"])
-            group_item.setFlags(Qt.ItemIsEnabled)  # header only, not selectable
-            bold_font = group_item.font(0)
+        for month_index, (month_key, weeks) in enumerate(month_groups.items()):
+            month_total = sum(len(entries) for entries in weeks.values())
+            month_item = QTreeWidgetItem([f"{month_key}  ({month_total})"])
+            month_item.setFlags(Qt.ItemIsEnabled)  # header only, not selectable
+            bold_font = month_item.font(0)
             bold_font.setBold(True)
-            group_item.setFont(0, bold_font)
-            self.list_widget.addTopLevelItem(group_item)
-            group_item.setExpanded(i == 0)  # most recent month open by default
+            month_item.setFont(0, bold_font)
+            self.list_widget.addTopLevelItem(month_item)
+            month_item.setExpanded(month_index == 0)  # most recent month open
 
-            for dt, lecture in entries:
-                day_label = f"{dt.month:02d}.{dt.day:02d}({WEEKDAYS_KR[dt.weekday()]})"
-                status_label = STATUS_LABELS.get(lecture.status, lecture.status)
-                correction_note = _correction_status_label(lecture)
-                if correction_note:
-                    status_label += f" · {correction_note}"
-                material_count = len(materials.decode_paths(lecture.material_path))
-                if material_count:
-                    status_label += f" · 자료 {material_count}개"
-                # Title on its own line so long lecture names stay readable,
-                # with date and state underneath.
-                child = QTreeWidgetItem([f"{lecture.title}\n{day_label} · {status_label}"])
-                child.setData(0, LECTURE_ID_ROLE, lecture.id)
-                group_item.addChild(child)
+            # Weeks arrive newest-first; number them oldest-first for display.
+            ordinals = {monday: n for n, monday in enumerate(sorted(weeks), start=1)}
+            for week_index, (monday, entries) in enumerate(weeks.items()):
+                week_item = QTreeWidgetItem([f"{_week_label(monday, ordinals[monday])}  ({len(entries)})"])
+                week_item.setFlags(Qt.ItemIsEnabled)
+                month_item.addChild(week_item)
+                # Only the newest week of the newest month starts open.
+                week_item.setExpanded(month_index == 0 and week_index == 0)
+
+                for dt, lecture in entries:
+                    day_label = f"{dt.month:02d}.{dt.day:02d}({WEEKDAYS_KR[dt.weekday()]})"
+                    status_label = STATUS_LABELS.get(lecture.status, lecture.status)
+                    correction_note = _correction_status_label(lecture)
+                    if correction_note:
+                        status_label += f" · {correction_note}"
+                    material_count = len(materials.decode_paths(lecture.material_path))
+                    if material_count:
+                        status_label += f" · 자료 {material_count}개"
+                    # Title on its own line so long lecture names stay readable,
+                    # with date and state underneath.
+                    child = QTreeWidgetItem([f"{lecture.title}\n{day_label} · {status_label}"])
+                    child.setData(0, LECTURE_ID_ROLE, lecture.id)
+                    week_item.addChild(child)
 
     def _reset_detail_header(self):
         """선택 항목이 없을 때 오른쪽 안내 문구를 기본 상태로 되돌립니다."""
@@ -1872,30 +2207,37 @@ class MainWindow(QMainWindow):
             return
 
         for i in range(self.list_widget.topLevelItemCount()):
-            group_item = self.list_widget.topLevelItem(i)
-            any_visible = False
-            for j in range(group_item.childCount()):
-                child = group_item.child(j)
-                match = query in child.text(0).lower()
-                if not match:
-                    lecture = db.get_lecture(child.data(0, LECTURE_ID_ROLE))
-                    if lecture:
-                        for path_str in (lecture.transcript_path, lecture.summary_path):
-                            path = Path(path_str) if path_str else None
-                            if not path or not path.is_file():
-                                continue
-                            try:
-                                content = path.read_text(encoding="utf-8").lower()
-                            except OSError:
-                                continue
-                            if query in content:
-                                match = True
-                                break
-                child.setHidden(not match)
-                any_visible = any_visible or match
-            group_item.setHidden(not any_visible)
-            if any_visible:
-                group_item.setExpanded(True)
+            month_item = self.list_widget.topLevelItem(i)
+            month_visible = False
+            for j in range(month_item.childCount()):
+                week_item = month_item.child(j)
+                week_visible = False
+                for k in range(week_item.childCount()):
+                    child = week_item.child(k)
+                    match = query in child.text(0).lower()
+                    if not match:
+                        lecture = db.get_lecture(child.data(0, LECTURE_ID_ROLE))
+                        if lecture:
+                            for path_str in (lecture.transcript_path, lecture.summary_path):
+                                path = Path(path_str) if path_str else None
+                                if not path or not path.is_file():
+                                    continue
+                                try:
+                                    content = path.read_text(encoding="utf-8").lower()
+                                except OSError:
+                                    continue
+                                if query in content:
+                                    match = True
+                                    break
+                    child.setHidden(not match)
+                    week_visible = week_visible or match
+                week_item.setHidden(not week_visible)
+                if week_visible:
+                    week_item.setExpanded(True)
+                month_visible = month_visible or week_visible
+            month_item.setHidden(not month_visible)
+            if month_visible:
+                month_item.setExpanded(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int):
         lecture_id = item.data(0, LECTURE_ID_ROLE)
@@ -1961,6 +2303,19 @@ class MainWindow(QMainWindow):
             return "먼저 녹취록이 있어야 교정할 수 있습니다."
 
         transcript_path = Path(lecture.transcript_path)
+        raw_path = Path(lecture.raw_transcript_path) if lecture.raw_transcript_path else None
+        if raw_path is not None and transcript_path == raw_path:
+            # Correction was interrupted last time (API failure, app closed),
+            # so transcript_path still points at the raw STT text. Correcting
+            # "in place" here would write the corrected text over the original
+            # raw file -- destroying it -- and leave the two paths equal, which
+            # is exactly what marks a lecture 교정 전. It would report success
+            # and still look uncorrected, however many times it was re-run.
+            stem = raw_path.stem
+            if stem.endswith("_raw"):
+                stem = stem[: -len("_raw")]
+            transcript_path = raw_path.with_name(stem + raw_path.suffix)
+
         self._enqueue_worker(CorrectTranscriptWorker(lecture_id, transcript_path, lecture.title))
         if lecture.summary_path:
             # transcript_path is re-read at run() time by SummaryWorker, so by
@@ -2059,10 +2414,19 @@ class MainWindow(QMainWindow):
             lecture = db.get_lecture(lecture_ids[0])
             rename_action = menu.addAction("이름 변경")
             rename_action.setData("rename")
+            has_transcript = bool(lecture and lecture.transcript_path)
             if lecture and lecture.status == "failed":
                 retry_action = menu.addAction("다시 시도")
                 retry_action.setData("retry")
-            else:
+            elif lecture and not has_transcript and lecture.audio_path:
+                # Recorded but never transcribed -- the app was closed before
+                # processing started, or it was cancelled. Without this the row
+                # had no action at all that could get it moving again: "다시
+                # 시도" only showed for failures, and the other entries need a
+                # transcript to work on.
+                transcribe_action = menu.addAction("녹취록 만들기")
+                transcribe_action.setData("retry")
+            elif has_transcript:
                 regenerate_action = menu.addAction("요약 다시 생성")
                 regenerate_action.setData("regenerate")
                 correct_action = menu.addAction("녹취록 교정")
@@ -2365,15 +2729,24 @@ class MainWindow(QMainWindow):
 
     def _select_lecture(self, lecture_id: int):
         for i in range(self.list_widget.topLevelItemCount()):
-            group_item = self.list_widget.topLevelItem(i)
-            for j in range(group_item.childCount()):
-                child = group_item.child(j)
-                if child.data(0, LECTURE_ID_ROLE) == lecture_id:
-                    group_item.setExpanded(True)
-                    self.list_widget.setCurrentItem(child)
-                    return
+            month_item = self.list_widget.topLevelItem(i)
+            for j in range(month_item.childCount()):
+                week_item = month_item.child(j)
+                for k in range(week_item.childCount()):
+                    child = week_item.child(k)
+                    if child.data(0, LECTURE_ID_ROLE) == lecture_id:
+                        month_item.setExpanded(True)
+                        week_item.setExpanded(True)
+                        self.list_widget.setCurrentItem(child)
+                        return
 
-    def _process_lecture(self, lecture_id: int, audio_path: Path, title: str):
+    def _process_lecture(self, lecture_id: int, audio_path: Path, title: str, auto: bool = True):
+        """`auto` marks the pipeline starting on its own after a recording or
+        an import. Those respect the 녹취록 자동 생성 switch; anything the user
+        asked for explicitly (녹취록 만들기 / 다시 시도) runs regardless."""
+        if auto and not settings.auto_transcribe():
+            self.status_label.setText("녹음 저장됨 (자동 녹취 꺼짐 — 목록에서 '녹취록 만들기')")
+            return
         self._enqueue_worker(ProcessingWorker(lecture_id, audio_path, title))
 
     def _enqueue_worker(self, worker: ProcessingWorker | SummaryWorker):
@@ -2494,7 +2867,7 @@ class MainWindow(QMainWindow):
         elif has_transcript:
             self.regenerate_summary(lecture_id)
         elif lecture.audio_path and Path(lecture.audio_path).is_file():
-            self._process_lecture(lecture_id, Path(lecture.audio_path), lecture.title)
+            self._process_lecture(lecture_id, Path(lecture.audio_path), lecture.title, auto=False)
         else:
             QMessageBox.warning(self, "다시 시도 불가", "원본 녹음 파일을 찾을 수 없습니다.")
 

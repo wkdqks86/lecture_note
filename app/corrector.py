@@ -1,8 +1,14 @@
 from typing import Callable
 
+from app import settings
 from app.anthropic_client import get_client
 
-MODEL = "claude-opus-5"
+# Correction is a constrained, mechanical task -- fix misheard words, change
+# nothing else -- and it now runs with the glossary and the day's own lecture
+# material as context, so it doesn't need the most expensive model. Its output
+# is as long as its input, which makes it the costliest stage by far, so the
+# model is configurable in the app rather than fixed here.
+DEFAULT_MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """\
 당신은 강의 녹취록 교정 전문가입니다. 아래는 음성 인식(STT)으로 자동 변환된 녹취록입니다. \
@@ -25,8 +31,9 @@ SYSTEM_PROMPT = """\
 
 
 class TranscriptCorrector:
-    def __init__(self):
+    def __init__(self, model: str | None = None):
         self.client = get_client()
+        self.model = model or settings.correction_model() or DEFAULT_MODEL
 
     def correct(
         self,
@@ -57,7 +64,7 @@ class TranscriptCorrector:
         parts: list[str] = []
         written = 0
         with self.client.messages.stream(
-            model=MODEL,
+            model=self.model,
             max_tokens=64000,
             system=system,
             messages=[{"role": "user", "content": transcript}],
