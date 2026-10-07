@@ -123,16 +123,47 @@ class AutoRecordController(QObject):
 
         self._start_period(current, now)
 
+    def _audio_path_for(self, period: int, now: datetime) -> Path:
+        """A path that is never already holding audio.
+
+        The name used to be date+period only, so restarting the app inside a
+        period produced the *same* path -- and `Recorder` opens WAV files with
+        "wb", which truncates. The part of the class already recorded was
+        silently thrown away. (`_finished_periods` doesn't help: it lives in
+        memory, so a restart forgets that the period ran at all and the next
+        clock check starts it again.)
+
+        Keep both takes instead and let the user decide which to use, or
+        stitch them. Losing audio is unrecoverable; an extra file is not.
+        """
+        base = RECORDINGS_DIR / f"auto_{now:%Y%m%d}_{period}.wav"
+        if not base.exists():
+            return base
+
+        # Restarted mid-period. Minute precision is enough to tell the takes
+        # apart, but keep counting in case of a crash loop inside one minute.
+        candidate = RECORDINGS_DIR / f"auto_{now:%Y%m%d}_{period}_{now:%H%M}.wav"
+        attempt = 2
+        while candidate.exists():
+            candidate = RECORDINGS_DIR / f"auto_{now:%Y%m%d}_{period}_{now:%H%M}-{attempt}.wav"
+            attempt += 1
+        return candidate
+
     def _start_period(self, period: Period, now: datetime):
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-        audio_path = RECORDINGS_DIR / f"auto_{now:%Y%m%d}_{period.period}.wav"
+        audio_path = self._audio_path_for(period.period, now)
+        # A suffixed name means an earlier take of this period is already on
+        # disk, so say so in the title -- otherwise the list shows two rows
+        # with identical names and no way to tell which is which.
+        is_retake = audio_path.name != f"auto_{now:%Y%m%d}_{period.period}.wav"
 
         self.recorder = Recorder(audio_path)
         self.recorder.start()
         self.active_period = period.period
         self.active_started_at = now
         self._active_audio_path = audio_path
-        self._active_title = f"{now:%Y-%m-%d} {period.period}교시 (자동 녹음)"
+        self._active_title = f"{now:%Y-%m-%d} {period.period}교시 (자동 녹음"
+        self._active_title += f" · {now:%H:%M} 재시작)" if is_retake else ")"
 
         self.drain_timer.start(DRAIN_INTERVAL_MS)
         self.period_started.emit(period.period)
