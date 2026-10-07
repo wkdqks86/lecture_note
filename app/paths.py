@@ -37,6 +37,9 @@ TERM_STATS_PATH = DATA_DIR / "term_stats.json"
 # Learned "misheard -> correct" pairs, applied without an API call.
 REPLACEMENTS_PATH = DATA_DIR / "replacements.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+# Periods ended early with "지금 종료". Persisted so quitting and reopening the
+# app inside that period doesn't start recording it all over again.
+FINISHED_PERIODS_PATH = DATA_DIR / "finished_periods.json"
 # Material registered for a given day up front, so lectures auto-recorded that
 # day are linked to it the moment they're created.
 DAY_MATERIAL_PATH = DATA_DIR / "day_material.json"

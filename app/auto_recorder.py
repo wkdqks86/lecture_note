@@ -4,6 +4,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from app import finished_periods
 from app.paths import RECORDINGS_DIR
 from app.recorder import Recorder
 from app.schedule import Period, load_schedule
@@ -38,8 +39,10 @@ class AutoRecordController(QObject):
         self.suspended = False
         # (date, period) pairs the user ended early. Without this the next
         # clock check sees we're still inside the period's time range and
-        # immediately starts recording it again.
-        self._finished_periods: set[tuple[str, int]] = set()
+        # immediately starts recording it again. Loaded from disk because the
+        # same thing happened across a restart: quitting and reopening the app
+        # inside an already-finished period began recording it a second time.
+        self._finished_periods: set[tuple[str, int]] = finished_periods.load()
 
         self.drain_timer = QTimer(self)
         self.drain_timer.timeout.connect(self._drain)
@@ -214,9 +217,28 @@ class AutoRecordController(QObject):
         if self.active_period is None:
             return
         period = self.active_period
-        self._finished_periods.add(self._finished_key(period, self._now()))
+        now = self._now()
+        self._finished_periods.add(self._finished_key(period, now))
+        # Written before stopping: if the app dies during the stop/transcribe
+        # work, the "don't record this again" fact must already be on disk.
+        finished_periods.record(now.date().isoformat(), period, now)
         self._stop_active()
         self.status_changed.emit(f"{period}교시 녹음 종료됨")
+
+    def finished_today(self) -> dict[int, str]:
+        """{교시: 끝낸 시각} ended early today -- the periods the clock would
+        otherwise pick back up. The UI goes through here rather than reading
+        storage itself, so where this is kept can change without touching it."""
+        return finished_periods.entries_for(self._now().date().isoformat())
+
+    def reopen_period(self, period: int) -> None:
+        """Undoes a "지금 종료" so the rest of the period records after all --
+        class resumed, or the button was a misclick. Takes effect immediately
+        if the clock is still inside that period."""
+        today = self._now().date().isoformat()
+        self._finished_periods.discard((today, period))
+        finished_periods.clear(today, period)
+        self.check_now()
 
     def next_period(self) -> Optional[Period]:
         """The next period still to start today, if any -- for an idle-state

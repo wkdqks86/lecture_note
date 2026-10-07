@@ -46,7 +46,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app import cuda_runtime, db, glossary, materials, replacements, settings, term_stats
+from app import (
+    cuda_runtime,
+    db,
+    finished_periods,
+    glossary,
+    materials,
+    replacements,
+    settings,
+    term_stats,
+)
 from app.auto_recorder import KST, AutoRecordController
 from app.cancellation import ProcessingCancelled
 from app.corrector import TranscriptCorrector
@@ -1396,6 +1405,15 @@ class AutoRecordStatusDialog(QDialog):
         layout.addLayout(material_row)
 
         layout.addSpacing(10)
+        finished_header = QLabel("오늘 끝낸 교시")
+        finished_header.setObjectName("sectionLabel")
+        layout.addWidget(finished_header)
+
+        self.finished_container = QVBoxLayout()
+        self.finished_container.setSpacing(6)
+        layout.addLayout(self.finished_container)
+
+        layout.addSpacing(10)
         failed_header = QLabel("최근 실패 항목")
         failed_header.setObjectName("sectionLabel")
         layout.addWidget(failed_header)
@@ -1513,7 +1531,41 @@ class AutoRecordStatusDialog(QDialog):
         self.pause_btn.setEnabled(recording)
         self.stop_btn.setEnabled(recording)
 
+        self._refresh_finished_list()
         self._refresh_failed_list()
+
+    def _refresh_finished_list(self):
+        """Periods ended early today, with a way back. Without this the only
+        way to undo a misclick was editing a file by hand -- and the suppression
+        is invisible, so "왜 녹음이 안 되지?" has no answer on screen."""
+        while self.finished_container.count():
+            item = self.finished_container.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        finished = self.controller.finished_today()
+        if not finished:
+            empty_label = QLabel("일찍 끝낸 교시가 없습니다.")
+            empty_label.setObjectName("recordHint")
+            self.finished_container.addWidget(empty_label)
+            return
+
+        for period in sorted(finished):
+            row = QHBoxLayout()
+            label = QLabel(f"{period}교시 · {finished[period]}에 종료")
+            label.setWordWrap(True)
+            row.addWidget(label, 1)
+            reopen_btn = QPushButton("다시 녹음")
+            reopen_btn.clicked.connect(lambda _checked, p=period: self._reopen_period(p))
+            row.addWidget(reopen_btn)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            self.finished_container.addWidget(row_widget)
+
+    def _reopen_period(self, period: int):
+        self.controller.reopen_period(period)
+        self._refresh()
 
     def _refresh_failed_list(self):
         while self.failed_container.count():
@@ -2010,7 +2062,32 @@ class MainWindow(QMainWindow):
         # filename check, silent, no harm running it every launch.
         db.backfill_raw_transcript_links()
 
+        # Finished transcripts get filed into transcripts/old/ by hand; follow
+        # them instead of showing "파일을 읽을 수 없습니다" on a file that is
+        # perfectly fine, just somewhere else.
+        db.relink_filed_away_files()
+
+        # The period used to live only in the filename and the title text.
+        # Recover it into columns for rows written before they existed.
+        db.backfill_lecture_periods()
+
+        # One-time import of the short-lived finished_periods.json.
+        finished_periods.migrate_legacy_file()
+
+        # A crash mid-period leaves audio on disk with no row, because the row
+        # is written when recording stops. Pick those up so they're visible
+        # (and transcribable) instead of being lost in the folder.
+        recovered = db.register_orphan_recordings()
+
         self._refresh_list()
+
+        if recovered:
+            self.tray.showMessage(
+                "강의 노트",
+                f"목록에 없던 녹음 {len(recovered)}개를 복구했습니다.",
+                QSystemTrayIcon.Information,
+                5000,
+            )
 
         # Deferred so the main window is painted before the offer appears on top
         # of it, rather than the dialog being the first thing on screen.
